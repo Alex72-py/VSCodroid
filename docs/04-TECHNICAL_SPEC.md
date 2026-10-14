@@ -1160,6 +1160,17 @@ it the list stayed open while the keyboard went down on API 33, API 36 with no h
 and API 37 emulators, a tap on a row ran it, a tap outside it closed it and brought the keyboard
 back, and a turn to landscape closed it (API 33 and 36).
 
+A keyboard that pastes from its own clipboard, as the suggestion strip of Gboard does, commits the
+text in one piece, and `NativeEditContext` typed it: `viewController.type` runs every character
+through the typing handlers, so 4720 characters of code held the page for 1.1 s on an API 33
+emulator with Gboard 12.4, and every line break was indented again on top of the indentation the
+text already carried (five lines of nested braces, four spaces apiece, came out at 8, 16 and 20).
+On Android patch 0029 hands a plain commit of more than 64 characters, or of any text that holds
+a line break, to `viewController.paste`, which inserts it in one edit and leaves it as it is: the
+same paste took 3 ms and the braces arrived unchanged. One character, an Enter and a
+composition are untouched. A DOM paste event, which Ctrl+V and the long-press Paste use, never
+took this path.
+
 ### 5.3 Visibility Control
 
 The row decides whether to show in one place, the inset listener installed by
@@ -1231,6 +1242,7 @@ flowchart TD
   P --> P26["0026 configuration: keep a folder's cached settings until its file is read"]
   P --> P27["0027 configuration: start a remote workspace from the settings the page read"]
   P --> P28["0028 code actions: keep the list open as the keyboard goes"]
+  P --> P29["0029 EditContext: a keyboard's long or multi-line commit is one paste"]
 ```
 
 Five of these are load-bearing in ways their titles understate:
