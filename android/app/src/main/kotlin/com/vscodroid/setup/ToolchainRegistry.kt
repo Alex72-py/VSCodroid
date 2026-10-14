@@ -115,9 +115,34 @@ object ToolchainRegistry {
             // dereferences 208 symlinks, and the constant every gate reads did
             // not move with it. Two comments in ToolchainManager were updated to
             // say "about 155 MB" while this stayed at 146.
-            estimatedSize = 156_000_000,
+            //
+            // 156,000,000 left 515,840 bytes over the 155,484,160 measured, which
+            // a Termux point release of openjdk-17 can spend, and then
+            // package-toolchains.sh refuses the tag. 160,000,000 leaves 4.5 MB.
+            estimatedSize = 160_000_000,
             downloadSize = 56_500_000,
             downloadUrl = "https://github.com/rmyndharis/VSCodroid/releases/latest/download/toolchain_java.zip",
+        ),
+        ToolchainInfo(
+            packName = "toolchain_cpp",
+            displayName = "C/C++",
+            shortLabel = "C/C++",
+            descriptionRes = R.string.toolchain_cpp_description,
+            // 248,060 KiB measured with `du -sk` over the pack's `usr/` tree,
+            // which is 254,013,440 bytes in 4 KiB blocks and 244.8 MB of file
+            // contents, over 3,790 files. libLLVM.so and libclang-cpp.so are
+            // 196.6 MB of it, the headers 30.9 MB and the clang resource
+            // directory 16 MB. 260,000,000 leaves 6 MB for the next point
+            // release of clang: package-toolchains.sh refuses to zip a tree
+            // above this, and a release tag is where that would be found.
+            //
+            // This is also the largest install pre-flight of the three. A first
+            // install over HTTP holds the staged copy and the one in `usr/` at
+            // once, so it asks for about twice this figure plus the buffer.
+            // The ZIP is 73,702,041 bytes.
+            estimatedSize = 260_000_000,
+            downloadSize = 74_000_000,
+            downloadUrl = "https://github.com/rmyndharis/VSCodroid/releases/latest/download/toolchain_cpp.zip",
         ),
     )
 
