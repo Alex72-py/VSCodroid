@@ -1158,7 +1158,8 @@ class SafUnfetchedDocumentTest {
     fun `a directory is deleted once a file made again over a declined delete has landed`() {
         val kept = mutableListOf<String>()
         engine.onKeptOnDevice = { file, _, _ -> kept.add(file.name) }
-        deviceTree(docsHoldingNotes)
+        val remaining = docsHoldingNotes.toMutableMap()
+        deviceTree(remaining)
         runBlocking { engine.initialSync(treeUri, mirror) { _, _ -> } }
         changedByAnotherApp("doc:notes.md")
         val notes = File(mirror, "docs/notes.md").apply { delete() }
@@ -1173,12 +1174,19 @@ class SafUnfetchedDocumentTest {
         )
         File(mirror, "docs").deleteRecursively()
 
+        every { DocumentsContract.deleteDocument(any(), any()) } answers {
+            val id = DocumentsContract.getDocumentId(secondArg())
+            remaining.replaceAll { _, entries -> entries.filterNot { "doc:${it.name}" == id } }
+            true
+        }
+
         for (name in gone) {
             engine.handleMirrorEvent(FileObserver.DELETE, File(mirror, "docs/$name"), mirror, treeUri)
         }
         engine.handleMirrorEvent(FileObserver.DELETE or isDirFlag, File(mirror, "docs"), mirror, treeUri)
         engine.runWriteBackLoop { false }
 
+        verify(exactly = 1) { DocumentsContract.deleteDocument(any(), uris.getValue("doc:notes.md")) }
         verify(exactly = 1) { DocumentsContract.deleteDocument(any(), uris.getValue("doc:docs")) }
         assertEquals(listOf("notes.md"), kept, "the directory was kept after its file had landed")
     }

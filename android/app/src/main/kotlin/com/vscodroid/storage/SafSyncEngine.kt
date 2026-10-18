@@ -1655,20 +1655,18 @@ class SafSyncEngine(private val context: Context) {
      * back under another name. The device keeps the document, and the next open brings it
      * back into the editor.
      *
-     * Ceilings: [keepsDeviceEdit]'s own, each spare copy of an unchanged document there
-     * being a declined delete of it here; a directory is declined for a file in it whose delete was
-     * declined ([keptOnDevice]), and otherwise not asked file by file, so a file under it
-     * that raised no delete of its own goes with it: one past [MAX_WATCHED_DIRECTORIES], or
-     * one another app added while the folder was open, which the mirror never held; and a
-     * declined delete is not tried again, so a file declined only because its read failed
-     * comes back at the next open like any other.
+     * A directory also checks its current descendants through [directoryDeleteIsSafe],
+     * because the provider's recursive delete includes children that raised no local
+     * event. A declined delete is not retried; the next open brings its device copy back.
      */
     private fun keepsDeviceDocument(job: SyncJob, docUri: Uri, access: OutboundAccess? = null): Boolean {
         val unread = holdsUnread(job.localPath, job.isDirectory)
         val held = (unread || job.isDirectory && holdsKept(job.localPath)) &&
             job.safTreeUri?.let { providerHolds(it, job.relativePath) } != false
         if (!held) {
-            if (job.isDirectory || deviceMovedPast(File(job.localPath), docUri, access) == null) {
+            val unchanged = if (job.isDirectory) directoryDeleteIsSafe(job, docUri) else
+                deviceMovedPast(File(job.localPath), docUri, access) == null
+            if (unchanged) {
                 return false
             }
             withCurrentMemory(access) { keptOnDevice.add(job.localPath) }
@@ -1682,6 +1680,69 @@ class SafSyncEngine(private val context: Context) {
             File(job.localPath), job.relativePath, job.isDirectory,
             changed = !job.isDirectory || !unread,
         )
+        return true
+    }
+
+    /**
+     * A recursive provider delete may remove children the mirror never saw. Ask at the
+     * drain, without updating the cache that identifies the documents already known.
+     * Each file must still hold its recorded bytes, including where its stamp did not
+     * move. Provider changes after this check remain outside the SAF delete contract.
+     */
+    private fun directoryDeleteIsSafe(job: SyncJob, docUri: Uri): Boolean {
+        val treeUri = job.safTreeUri ?: return false
+        val knownIds = synchronized(docIdCache) {
+            if (cacheTree != treeUri) return false
+            docIdCache.toMap()
+        }
+        val root = File(job.localPath)
+        val states = deviceSeen.toMap()
+        try {
+            val directoryId = DocumentsContract.getDocumentId(docUri)
+            if (directoryId.isNullOrEmpty() || knownIds[job.relativePath] != directoryId) return false
+            val pending = ArrayDeque<Pair<String, String>>()
+            pending.add(directoryId to job.relativePath)
+            val visited = mutableSetOf(directoryId)
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            )
+            while (pending.isNotEmpty()) {
+                val (parentId, parentPath) = pending.removeFirst()
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
+                context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                    cursor.extras?.let { extras ->
+                        if (extras.getBoolean(DocumentsContract.EXTRA_LOADING) ||
+                            extras.containsKey(DocumentsContract.EXTRA_ERROR)
+                        ) return false
+                    }
+                    val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getString(idIndex)
+                        val name = cursor.getString(nameIndex)
+                        val mime = cursor.getString(mimeIndex)
+                        if (id.isNullOrEmpty() || !isSafeSegment(name) || mime.isNullOrEmpty()) return false
+                        val path = "$parentPath/$name"
+                        if (knownIds[path] != id || !visited.add(id)) return false
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                            pending.add(id to path)
+                        } else {
+                            val local = File(root, path.removePrefix("${job.relativePath}/"))
+                            val seen = states[local.absolutePath] ?: return false
+                            val digest = seen.sha256 ?: return false
+                            val uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, id)
+                            if (!digest.contentEquals(deviceSha256(uri, seen.length))) return false
+                        }
+                    }
+                } ?: return false
+            }
+        } catch (e: Exception) {
+            Logger.w(tag, "Could not verify directory contents before deletion: ${e.javaClass.simpleName}")
+            return false
+        }
         return true
     }
 

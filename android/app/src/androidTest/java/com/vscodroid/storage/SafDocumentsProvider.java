@@ -24,11 +24,16 @@ public final class SafDocumentsProvider extends DocumentsProvider {
     public static final String AUTHORITY = "com.vscodroid.test.saf.documents";
     public static final String ROOT_ID = "root";
     public static final String FILE_NAME = "notes.txt";
+    public static final String DIRECTORY_ID = "folder";
+    public static final String KNOWN_CHILD_ID = "folder/known.txt";
+    public static final String NEW_CHILD_ID = "folder/new.txt";
 
     private final AtomicInteger writeOpens = new AtomicInteger();
     private final AtomicInteger createCalls = new AtomicInteger();
     private volatile CountDownLatch readEntered = new CountDownLatch(1);
     private volatile CountDownLatch readRelease = new CountDownLatch(0);
+    private final AtomicInteger deleteCalls = new AtomicInteger();
+    private volatile boolean failDirectoryListing;
 
     @Override
     public boolean onCreate() {
@@ -37,6 +42,19 @@ public final class SafDocumentsProvider extends DocumentsProvider {
 
     private File document() {
         return new File(new File(getContext().getFilesDir(), "saf-documents"), FILE_NAME);
+    }
+
+    private File directoryDocument(String id) throws FileNotFoundException {
+        if (!DIRECTORY_ID.equals(id) && !KNOWN_CHILD_ID.equals(id) && !NEW_CHILD_ID.equals(id)) {
+            throw new FileNotFoundException(id);
+        }
+        return new File(document().getParentFile(), id);
+    }
+
+    private void clearDirectory() throws IOException {
+        Files.deleteIfExists(directoryDocument(KNOWN_CHILD_ID).toPath());
+        Files.deleteIfExists(directoryDocument(NEW_CHILD_ID).toPath());
+        Files.deleteIfExists(directoryDocument(DIRECTORY_ID).toPath());
     }
 
     @Override
@@ -64,15 +82,38 @@ public final class SafDocumentsProvider extends DocumentsProvider {
     @Override
     public Cursor queryChildDocuments(String parentDocumentId, String[] projection, String sortOrder)
             throws FileNotFoundException {
-        if (!ROOT_ID.equals(parentDocumentId)) throw new FileNotFoundException(parentDocumentId);
         MatrixCursor cursor = documents(projection);
-        if (document().isFile()) addDocument(cursor, FILE_NAME);
+        if (ROOT_ID.equals(parentDocumentId)) {
+            if (document().isFile()) addDocument(cursor, FILE_NAME);
+            if (directoryDocument(DIRECTORY_ID).isDirectory()) addDocument(cursor, DIRECTORY_ID);
+        } else if (DIRECTORY_ID.equals(parentDocumentId)) {
+            if (failDirectoryListing) throw new FileNotFoundException("Directory listing unavailable");
+            if (!directoryDocument(DIRECTORY_ID).isDirectory()) throw new FileNotFoundException(parentDocumentId);
+            if (directoryDocument(KNOWN_CHILD_ID).isFile()) addDocument(cursor, KNOWN_CHILD_ID);
+            if (directoryDocument(NEW_CHILD_ID).isFile()) addDocument(cursor, NEW_CHILD_ID);
+        } else {
+            throw new FileNotFoundException(parentDocumentId);
+        }
         return cursor;
     }
 
     @Override
     public boolean isChildDocument(String parentDocumentId, String documentId) {
-        return ROOT_ID.equals(parentDocumentId) && FILE_NAME.equals(documentId);
+        return ROOT_ID.equals(parentDocumentId) && (FILE_NAME.equals(documentId)
+            || DIRECTORY_ID.equals(documentId) || KNOWN_CHILD_ID.equals(documentId) || NEW_CHILD_ID.equals(documentId))
+            || DIRECTORY_ID.equals(parentDocumentId)
+                && (KNOWN_CHILD_ID.equals(documentId) || NEW_CHILD_ID.equals(documentId));
+    }
+
+    @Override
+    public void deleteDocument(String documentId) throws FileNotFoundException {
+        deleteCalls.incrementAndGet();
+        try {
+            if (DIRECTORY_ID.equals(documentId)) clearDirectory();
+            else Files.deleteIfExists((FILE_NAME.equals(documentId) ? document() : directoryDocument(documentId)).toPath());
+        } catch (IOException exception) {
+            throw new FileNotFoundException(exception.getMessage());
+        }
     }
 
     @Override
@@ -94,7 +135,7 @@ public final class SafDocumentsProvider extends DocumentsProvider {
     @Override
     public ParcelFileDescriptor openDocument(String documentId, String mode, CancellationSignal signal)
             throws FileNotFoundException {
-        if (!FILE_NAME.equals(documentId)) throw new FileNotFoundException(documentId);
+        File file = FILE_NAME.equals(documentId) ? document() : directoryDocument(documentId);
         if (mode.contains("w")) {
             writeOpens.incrementAndGet();
         } else {
@@ -109,13 +150,16 @@ public final class SafDocumentsProvider extends DocumentsProvider {
                 throw new FileNotFoundException("The fixture read was interrupted");
             }
         }
-        return ParcelFileDescriptor.open(document(), ParcelFileDescriptor.parseMode(mode));
+        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.parseMode(mode));
     }
 
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
         if (!"reset".equals(method) && !"read".equals(method) && !"stats".equals(method)
-                && !"blockRead".equals(method) && !"releaseRead".equals(method)) {
+                && !"blockRead".equals(method) && !"releaseRead".equals(method)
+                && !"directoryReset".equals(method) && !"directoryAdd".equals(method)
+                && !"directoryEdit".equals(method) && !"directoryRead".equals(method)
+                && !"directoryStats".equals(method) && !"directoryFailListing".equals(method)) {
             return super.call(method, arg, extras);
         }
         try {
@@ -135,6 +179,8 @@ public final class SafDocumentsProvider extends DocumentsProvider {
                     if (!directory.isDirectory() && !directory.mkdirs()) {
                         throw new IOException("Cannot create test document directory");
                     }
+                    clearDirectory();
+                    failDirectoryListing = false;
                     if (extras != null && extras.getBoolean("empty")) {
                         Files.deleteIfExists(file.toPath());
                     } else {
@@ -144,6 +190,33 @@ public final class SafDocumentsProvider extends DocumentsProvider {
                     }
                     writeOpens.set(0);
                     createCalls.set(0);
+                    deleteCalls.set(0);
+                    break;
+                case "directoryReset":
+                    clearDirectory();
+                    if (!directoryDocument(DIRECTORY_ID).mkdirs()) throw new IOException("Cannot create fixture folder");
+                    Files.write(directoryDocument(KNOWN_CHILD_ID).toPath(), extras.getByteArray("bytes"));
+                    failDirectoryListing = false;
+                    deleteCalls.set(0);
+                    break;
+                case "directoryAdd":
+                    Files.write(directoryDocument(NEW_CHILD_ID).toPath(), extras.getByteArray("bytes"));
+                    break;
+                case "directoryEdit":
+                    Files.write(directoryDocument(KNOWN_CHILD_ID).toPath(), extras.getByteArray("bytes"));
+                    break;
+                case "directoryRead":
+                    result.putByteArray("bytes", Files.readAllBytes(directoryDocument(
+                        extras != null && extras.getBoolean("newChild") ? NEW_CHILD_ID : KNOWN_CHILD_ID).toPath()));
+                    break;
+                case "directoryStats":
+                    result.putBoolean("exists", directoryDocument(DIRECTORY_ID).isDirectory());
+                    result.putBoolean("knownExists", directoryDocument(KNOWN_CHILD_ID).isFile());
+                    result.putBoolean("newExists", directoryDocument(NEW_CHILD_ID).isFile());
+                    result.putInt("deleteCalls", deleteCalls.get());
+                    break;
+                case "directoryFailListing":
+                    failDirectoryListing = true;
                     break;
                 case "read":
                     result.putByteArray("bytes", Files.readAllBytes(file.toPath()));
@@ -180,14 +253,16 @@ public final class SafDocumentsProvider extends DocumentsProvider {
 
     private void addDocument(MatrixCursor cursor, String id) throws FileNotFoundException {
         boolean root = ROOT_ID.equals(id);
-        File file = document();
-        if (!root && (!FILE_NAME.equals(id) || !file.isFile())) throw new FileNotFoundException(id);
+        File file = root || FILE_NAME.equals(id) ? document() : directoryDocument(id);
+        if (!root && !file.exists()) throw new FileNotFoundException(id);
+        boolean directory = root || file.isDirectory();
         cursor.newRow()
             .add(Document.COLUMN_DOCUMENT_ID, id)
-            .add(Document.COLUMN_DISPLAY_NAME, root ? "VSCodroid test documents" : FILE_NAME)
-            .add(Document.COLUMN_MIME_TYPE, root ? Document.MIME_TYPE_DIR : "text/plain")
-            .add(Document.COLUMN_FLAGS, root ? Document.FLAG_DIR_SUPPORTS_CREATE : Document.FLAG_SUPPORTS_WRITE)
-            .add(Document.COLUMN_SIZE, root ? 0L : file.length())
-            .add(Document.COLUMN_LAST_MODIFIED, root ? 0L : file.lastModified());
+            .add(Document.COLUMN_DISPLAY_NAME, root ? "VSCodroid test documents" : file.getName())
+            .add(Document.COLUMN_MIME_TYPE, directory ? Document.MIME_TYPE_DIR : "text/plain")
+            .add(Document.COLUMN_FLAGS, directory ? Document.FLAG_DIR_SUPPORTS_CREATE | Document.FLAG_SUPPORTS_DELETE
+                : Document.FLAG_SUPPORTS_WRITE | Document.FLAG_SUPPORTS_DELETE)
+            .add(Document.COLUMN_SIZE, directory ? 0L : file.length())
+            .add(Document.COLUMN_LAST_MODIFIED, directory ? 0L : file.lastModified());
     }
 }
