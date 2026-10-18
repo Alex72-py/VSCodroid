@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Sign-in returns retain their original request identity until the editor page changes.
+
 - Device-folder sync preserves local edits when a conflicting device copy cannot be kept and protects documents in directories the provider could not list.
 - Reopening a device folder rejects stale saves, deletes and watcher callbacks from the previous sync.
 - Reopening a device folder reclaims abandoned temporary downloads while retaining active copies and existing workspace files.

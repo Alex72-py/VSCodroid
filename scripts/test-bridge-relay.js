@@ -29,6 +29,8 @@ const Module = require('module');
 const vm = require('vm');
 const { EXTENSIONS_DIR, newestExtensionDir } = require('./lib/bundled-extension');
 
+require('./test-auth-callback-provider');
+
 const ROOT = path.join(__dirname, '..');
 const MAIN_ACTIVITY = path.join(
     ROOT, 'android/app/src/main/kotlin/com/vscodroid/MainActivity.kt',

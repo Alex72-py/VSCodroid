@@ -102,7 +102,7 @@ class OpenExternalUrlRefusalTest {
          */
         const val REMOTE =
             "https://github.com/login/oauth/authorize?client_id=abc" +
-                "&state=http%253A%252F%252F127.0.0.1%253A13337%252Fcallback%253Fvscode-reqid%253D707"
+                "&state=http%253A%252F%252F127.0.0.1%253A13337%252Fcallback%253Fvscode-reqid%253D707&vscodroid-nonce=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
         /** The id [REMOTE] carries, matched against what the window recorded. */
         const val REMOTE_REQUEST_ID = "707"
@@ -110,7 +110,7 @@ class OpenExternalUrlRefusalTest {
         /** A plain-http sign-in, the LAN shape that leaves through ACTION_VIEW. */
         const val REMOTE_HTTP =
             "http://192.168.1.50/signin?redirect_uri=" +
-                "http%3A%2F%2F127.0.0.1%3A13337%2Fcallback%3Fvscode-reqid%3D808"
+                "http%3A%2F%2F127.0.0.1%3A13337%2Fcallback%3Fvscode-reqid%3D808&vscodroid-nonce=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
         const val REMOTE_HTTP_REQUEST_ID = "808"
 
@@ -143,13 +143,14 @@ class OpenExternalUrlRefusalTest {
      */
     @AfterEach
     fun handBackArmedRequests() {
-        AuthTabWindow.disarm(
-            listOf(REMOTE_REQUEST_ID, REMOTE_HTTP_REQUEST_ID, OWN_CALLBACK_REQUEST_ID)
-        )
+        AuthTabWindow.beginPage()
     }
 
     @BeforeEach
     fun setUp() {
+        AuthTabWindow.beginPage()
+        AuthTabWindow.register(REMOTE_REQUEST_ID, "a".repeat(32), "d".repeat(32), AuthTabWindow.pageGeneration())
+        AuthTabWindow.register(REMOTE_HTTP_REQUEST_ID, "a".repeat(32), "d".repeat(32), AuthTabWindow.pageGeneration())
         mockkObject(Logger)
         every { Logger.w(any(), any()) } just Runs
         every { Logger.e(any(), any(), any()) } just Runs
@@ -274,6 +275,75 @@ class OpenExternalUrlRefusalTest {
      * is what makes the arming real and the assertion able to fail.
      */
     @Test
+    fun `opening a future id cannot preseed the real workbench request`() {
+        val uri = mockk<Uri>(relaxed = true)
+        every { uri.host } returns "localhost"
+        every { uri.scheme } returns "http"
+        every { Uri.parse(any()) } returns uri
+        mockkConstructor(Intent::class)
+        every { anyConstructed<Intent>().addFlags(any()) } returns mockk(relaxed = true)
+        val prefix = "http://example.com/?vscode-reqid=1"
+        bridge.openExternalUrl("$prefix&vscodroid-nonce=${"b".repeat(32)}", security.getSessionToken())
+        bridge.openExternalUrl(prefix, security.getSessionToken())
+        assertNull(AuthTabWindow.nonceFor("1"))
+        assertNull(AuthTabWindow.armedAt("1"))
+        assertTrue(bridge.registerAuthCallback("1", "a".repeat(32), "d".repeat(32), AuthTabWindow.pageGeneration(), security.getSessionToken()))
+        assertEquals("", bridge.openExternalUrl("$prefix&vscodroid-nonce=${"a".repeat(32)}", security.getSessionToken()))
+        assertEquals("a".repeat(32), AuthTabWindow.nonceFor("1"))
+        assertEquals(1L, AuthTabWindow.armedAt("1"))
+    }
+
+    @Test
+    fun `registration requires the current token and records no active browser launch`() {
+        assertFalse(bridge.registerAuthCallback("909", "c".repeat(32), "d".repeat(32), AuthTabWindow.pageGeneration(), "wrong"))
+        assertNull(AuthTabWindow.nonceFor("909"))
+        assertTrue(bridge.registerAuthCallback("909", "c".repeat(32), "d".repeat(32), AuthTabWindow.pageGeneration(), security.getSessionToken()))
+        assertEquals("c".repeat(32), AuthTabWindow.nonceFor("909"))
+        assertNull(AuthTabWindow.armedAt("909"))
+    }
+
+    @Test
+    fun `a failed duplicate browser launch preserves the pending sign-in identity`() {
+        val original = "a".repeat(32)
+        val uri = mockk<Uri>(relaxed = true)
+        every { uri.host } returns "localhost"
+        every { uri.scheme } returns "http"
+        every { Uri.parse(any()) } returns uri
+        mockkConstructor(Intent::class)
+        every { anyConstructed<Intent>().addFlags(any()) } returns mockk(relaxed = true)
+        val address = REMOTE_HTTP
+        assertEquals("", bridge.openExternalUrl(address, security.getSessionToken()))
+        every { context.startActivity(any()) } throws ActivityNotFoundException()
+
+        for (other in listOf(REMOTE_HTTP.substringBefore("&vscodroid-nonce="), REMOTE_HTTP.replace(original, "b".repeat(32)))) {
+            assertEquals(NO_HANDLER, bridge.openExternalUrl(other, security.getSessionToken()))
+            assertEquals(original, AuthTabWindow.nonceFor(REMOTE_HTTP_REQUEST_ID))
+            assertEquals(1L, AuthTabWindow.armedAt(REMOTE_HTTP_REQUEST_ID))
+        }
+    }
+
+    @Test
+    fun `a failed browser launch cannot roll back a replacement page's request`() {
+        val replacement = "c".repeat(32)
+        val uri = mockk<Uri>(relaxed = true)
+        every { uri.host } returns "localhost"
+        every { uri.scheme } returns "http"
+        every { Uri.parse(REMOTE_HTTP) } returns uri
+        mockkConstructor(Intent::class)
+        every { anyConstructed<Intent>().addFlags(any()) } returns mockk(relaxed = true)
+        every { context.startActivity(any()) } answers {
+            AuthTabWindow.beginPage()
+            AuthTabWindow.register(REMOTE_HTTP_REQUEST_ID, replacement, "d".repeat(32), AuthTabWindow.pageGeneration())
+            AuthTabWindow.launched(AuthTabWindow.arm(listOf(REMOTE_HTTP_REQUEST_ID), replacement, 200L))
+            throw ActivityNotFoundException()
+        }
+
+        assertEquals(NO_HANDLER, bridge.openExternalUrl(REMOTE_HTTP, security.getSessionToken()))
+        assertEquals(replacement, AuthTabWindow.nonceFor(REMOTE_HTTP_REQUEST_ID))
+        assertEquals(200L, AuthTabWindow.armedAt(REMOTE_HTTP_REQUEST_ID))
+    }
+
+    @Test
     fun `a launch that fails puts the auth callback window back`() {
         val armedAt = 999_999L
 
@@ -304,8 +374,8 @@ class OpenExternalUrlRefusalTest {
         )
 
         verifyOrder {
-            AuthTabWindow.arm(listOf(REMOTE_REQUEST_ID), any(), armedAt)
-            AuthTabWindow.disarm(listOf(REMOTE_REQUEST_ID))
+            AuthTabWindow.arm(listOf(REMOTE_REQUEST_ID), any(), armedAt, any())
+            AuthTabWindow.disarm(any())
         }
         assertNull(
             AuthTabWindow.armedAt(REMOTE_REQUEST_ID),
@@ -353,7 +423,7 @@ class OpenExternalUrlRefusalTest {
             "the app's own callback was reported as opened, so the relay resolves the " +
                 "caller's promise for a launch that must not happen",
         )
-        verify(exactly = 0) { AuthTabWindow.arm(any(), any(), any()) }
+        verify(exactly = 0) { AuthTabWindow.arm(any(), any(), any(), any()) }
         verify(exactly = 0) { context.startActivity(any()) }
         assertNull(
             AuthTabWindow.armedAt(OWN_CALLBACK_REQUEST_ID),
@@ -379,7 +449,7 @@ class OpenExternalUrlRefusalTest {
             "https://code.visualstudio.com/docs", security.getSessionToken()
         )
 
-        verify(exactly = 1) { AuthTabWindow.arm(emptyList(), any(), any()) }
+        verify(exactly = 1) { AuthTabWindow.arm(emptyList(), any(), any(), any()) }
     }
 
     /*

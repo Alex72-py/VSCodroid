@@ -154,6 +154,8 @@ class BridgeTokenUniformityTest {
         // context nor a collaborator and would look identical to one that refused. They are
         // stubbed so the real implementations cannot run, but the detection below is not
         // stub-shaped: `wasNot Called` catches any call, including ones added later.
+        mockkObject(AuthTabWindow)
+        every { AuthTabWindow.register(any(), any(), any(), any()) } returns false
         mockkObject(CrashReporter)
         every { CrashReporter.getLastCrash() } returns null
         every { CrashReporter.clearCrashLogs() } just Runs
@@ -328,7 +330,7 @@ class BridgeTokenUniformityTest {
             val f = Fixture()
             // Singletons outlive the fixture, so their call history has to be reset per
             // method or the first method that logs would condemn every method after it.
-            clearMocks(Logger, CrashReporter, answers = false)
+            clearMocks(Logger, CrashReporter, AuthTabWindow, answers = false)
             val args = m.parameterTypes.map { argFor(it) }.toTypedArray()
             val reasons = mutableListOf<String>()
 
@@ -343,7 +345,7 @@ class BridgeTokenUniformityTest {
             }
 
             try {
-                (f.collaborators + listOf(Logger, CrashReporter))
+                (f.collaborators + listOf(Logger, CrashReporter, AuthTabWindow))
                     .forEach { c -> verify { c wasNot Called } }
             } catch (_: Throwable) {
                 reasons += "touched a collaborator"

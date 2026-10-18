@@ -24,7 +24,8 @@ Four assertions:
     tree without this;
   * every step has exactly one of `uses` or `run`. Neither is the bare-name
     case above. Both at once is also rejected by the runner;
-  * every `uses` reference is pinned to a full 40-character commit SHA. A
+  * every external `uses` reference is pinned to a full 40-character commit SHA;
+    local reusable workflows must exist and use the caller's revision. A
     floating tag is resolved at run time by whoever controls it, and these
     workflows publish the release assets, including the digest manifest that
     non-Play toolchain installs verify against;
@@ -114,6 +115,7 @@ except ModuleNotFoundError:
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github/workflows"
 PINNED = re.compile(r"@[0-9a-f]{40}$")
+LOCAL_WORKFLOW = re.compile(r"^\./\.github/workflows/[^/]+\.ya?ml$")
 # The one shape of gate the fourth rule accepts: the event named, by equality.
 ALLOWLIST_GATE = re.compile(r"github\.event_name\s*==\s*'[a-z_]+'")
 
@@ -141,6 +143,13 @@ def steps_of(doc):
     for job_name, job in (doc.get("jobs") or {}).items():
         for i, step in enumerate(job.get("steps") or []):
             yield job_name, i, step
+
+
+def valid_job_reference(ref):
+    """Local workflows use the caller's revision; external workflows need a SHA."""
+    if ref.startswith("./"):
+        return bool(LOCAL_WORKFLOW.fullmatch(ref))
+    return bool(PINNED.search(ref))
 
 
 def triggers_of(doc):
@@ -249,6 +258,19 @@ def self_test() -> int:
     to fire on, and a rule that has stopped firing prints what a clean tree
     prints. Each refused shape here was one the rule once admitted.
     """
+    for ref, wanted in (
+        ("./.github/workflows/codeoss-build.yml", True),
+        ("./.github/workflows/codeoss-build.yaml", True),
+        ("owner/repo/.github/workflows/build.yml@" + "a" * 40, True),
+        ("owner/repo/.github/workflows/build.yml@main", False),
+        ("./.github/workflows/nested/build.yml", False),
+        ("./.github/workflows/../build.yml", False),
+    ):
+        if valid_job_reference(ref) != wanted:
+            print(f"  FAIL   self-test: reusable workflow reference {ref!r}")
+            return 1
+    print("  ok     self-test: reusable workflows require a local path or full SHA")
+
     def workflow(gate):
         return {"on": {"push": {"tags": ["v*"]}, "workflow_dispatch": None},
                 "permissions": {"contents": "write"},
@@ -296,6 +318,17 @@ def main() -> int:
         bad, writers = ungated_writers(path, doc)
         failures.extend(bad)
         gated_writers += writers - len(bad)
+        for job_name, job in (doc.get("jobs") or {}).items():
+            if "uses" not in job:
+                continue
+            ref = str(job["uses"])
+            if not valid_job_reference(ref):
+                failures.append(
+                    f"{path.name}: job {job_name} uses {ref}, which is neither "
+                    "a same-revision local workflow nor pinned to a full SHA"
+                )
+            elif ref.startswith("./") and not (ROOT / ref).is_file():
+                failures.append(f"{path.name}: job {job_name} uses missing workflow {ref}")
         for job, i, step in steps_of(doc):
             checked_steps += 1
             where = f"{path.name}: job {job}, step {i}"
@@ -335,7 +368,7 @@ def main() -> int:
 
     print(f"  ok     all {checked_steps} steps in {checked_files} workflows "
           f"have exactly one of uses/run")
-    print(f"  ok     every uses reference is pinned to a full commit SHA")
+    print("  ok     every uses reference is pinned to a full SHA or a same-revision local workflow")
     # Zero is a legitimate answer and reads as one: it says no workflow that can
     # be started by hand also holds a write-scoped job, which is the state this
     # rule wants. It is not the empty-glob case the assertion above covers.

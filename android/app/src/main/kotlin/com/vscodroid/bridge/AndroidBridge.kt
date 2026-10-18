@@ -74,16 +74,7 @@ private const val DRAIN_JOIN_MILLIS = 1_000L
  */
 internal const val AUTH_TAB_WINDOW_MILLIS = 10 * 60 * 1000L
 
-/**
- * How many sign-in requests are remembered at once.
- *
- * A bound, not a policy. Entries are kept past their own window on purpose, so
- * that a callback arriving late can be told apart from one nobody asked for and
- * the user given a reason for the first; something therefore has to stop the
- * record growing for the life of the process. Signing in is a deliberate act a
- * person performs a handful of times in a session, so the entry older than this
- * many is the one least likely to still be owed an explanation.
- */
+/** Bound retained identities per workbench document without evicting pending requests. */
 private const val MAX_TRACKED_SIGN_INS = 32
 
 /**
@@ -137,29 +128,8 @@ private val AUTH_CALLBACK_NONCE = Regex("""vscodroid-nonce(?:=|%(?:25)*3[Dd])([0
 /**
  * How many request ids one address may record.
  *
- * A bound, not a policy, and it is the record above that needs it. `launches`
- * keeps the most recent [MAX_TRACKED_SIGN_INS] launches and evicts the eldest to
- * stay there, while a URL can name as many ids as whoever wrote it cares to
- * type, and both callers of this function record every id they are handed. So a
- * single address carrying that many ids pushed out the sign-in the user had open
- * in the browser at that moment, before any browser was even launched. Its
- * callback then arrives for an id nothing recorded and is dropped in the log with
- * no message at all, which leaves the extension waiting for ever on a value
- * nothing will write.
- *
- * Eight rather than one because nobody has surveyed real authorisation addresses
- * beyond the shapes in `AuthRequestIdTest`, and every one of those names exactly
- * one request. The figure is generous on purpose: the cost of it being too low
- * is a sign-in that cannot complete, and the cost of it being too high is only
- * that fewer such addresses are needed to reach the same eviction.
- *
- * Taken off the lazy sequence rather than the finished list, so the scan stops
- * once it has enough. The whole match runs on the thread the calling page is
- * blocked on, and the address is that page's to choose.
- *
- * It does not close the eviction on its own, and should not be read as doing so.
- * Enough separate launches still fill the record; what this removes is the
- * variant that needs one call, no browser and nothing on screen.
+ * The scan stops after a small number of distinct ids so an address cannot
+ * monopolize the document's bounded sign-in record in one launch.
  */
 private const val MAX_AUTH_REQUEST_IDS = 8
 
@@ -346,132 +316,95 @@ internal val STORAGE_BUSY = R.string.bridge_storage_busy
 private const val MAX_QUEUED_DISK_COMMANDS = 4
 
 /**
- * The sign-in requests this app launched a browser for, and when.
- *
- * Keyed by request id rather than being a single reading, and that is the whole
- * of the narrowing. It used to be one timestamp written by *every*
- * `openExternalUrl` call, so opening a documentation link widened the window in
- * which an unsolicited `vscodroid://callback` would be answered exactly as much
- * as starting a sign-in did. Now a launch arms only the ids it actually carries
- * out of the app, and a callback is judged against its own launch: an id nobody
- * launched is refused however recently a browser was opened.
- *
- * The `vscodroid://callback` relay has nothing else to test. Its VIEW filter is
- * exported and BROWSABLE, so any installed app or any page the user taps can fire
- * it, and the id it names is a counter from one rather than a secret. What an
- * outside caller cannot supply is a sign-in this app started.
- *
- * Deliberately process-scoped and not persisted. The ids the workbench waits on
- * live in an in-memory Set that does not survive the page, so after a restart
- * there is no pending request a relayed value could satisfy; persisting this
- * would only widen the window for callbacks that could not be delivered anyway.
- *
- * Entries are not removed when a callback is accepted. Two reasons, and the
- * second is not obvious: a late callback has to stay distinguishable from an
- * invented one so the user can be told why the sign-in failed, and the forced
- * reload on returning from the background asks this object whether a sign-in is
- * still in flight, so consuming the entry on arrival would let that reload fire
- * into the moment the workbench is collecting the value.
- *
- * They are removed once that explanation has been given, which is the bound on
- * it. An entry kept for the life of the process is one an outside caller can
- * name at will through the exported filter, and the id it has to guess is a
- * small integer; taking the entry back as the message goes up means each launch
- * can produce that message at most once, and every repeat lands in the branch
- * that says nothing.
- *
- * Time is supplied by callers from the monotonic clock, never from wall time, so
- * that changing the device clock mid-sign-in neither breaks a real return nor
- * reopens the window. No arithmetic happens here; the window is applied by
- * `authCallbackIsExpected`, which this object deliberately does not call.
+ * Launch identities belong to one workbench document, whose request counter
+ * restarts on reload. An address opened later in that document cannot replace
+ * either the original secret or its time window. Expired identities stay
+ * reserved until the document changes; failed browser launches can roll back.
  */
 object AuthTabWindow {
-
-    /**
-     * One browser launch: when it happened, and the secret the address carried.
-     *
-     * The secret is what a callback has to produce, and it is null when the
-     * address carried none. That is not a hole a caller can open: both arming
-     * sites take an address this app was asked to open, one behind the session
-     * token and the other behind a main-frame navigation of our own page.
-     */
-    internal data class Launch(val at: Long, val nonce: String?)
-
-    private val launches = object : LinkedHashMap<String, Launch>() {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Launch>): Boolean =
-            size > MAX_TRACKED_SIGN_INS
+    internal class Launch(val nonce: String, val documentId: String) {
+        var at: Long? = null
+        var expired = false
+        var outstanding = 0
+        var succeeded = false
+    }
+    class Attempt internal constructor(
+        internal val generation: Long, internal val launches: List<Launch>,
+    ) {
+        internal var completed = false
+        fun isEmpty(): Boolean = launches.isEmpty()
     }
 
-    /**
-     * Records a browser launch against the request ids it carries.
-     *
-     * An id already recorded is moved forward to this launch's reading rather
-     * than keeping its earlier one, because ids repeat. The workbench mints them
-     * from a class static that is re-initialised with the page --
-     * `static{this.REQUEST_ID=0}`, then `++REQUEST_ID` per request -- so every
-     * reload, folder switch and renderer recreation starts counting at one again.
-     * "Already recorded" therefore does not mean the same request seen twice; it
-     * routinely means a launch from a page that no longer exists. Keeping that
-     * older reading let it decide the window for the sign-in actually in flight,
-     * and refused a callback that came back in seconds with a message saying it
-     * had taken too long.
-     *
-     * @return the ids this call recorded, which is what [disarm] takes back if
-     *   the launch then throws. Rolling a repeated id back removes it rather than
-     *   restoring the older reading: the request that reading belonged to was
-     *   minted by a page since replaced, and the workbench holds the ids it is
-     *   waiting on in memory, so nothing is left that could still satisfy it.
-     */
+    private val launches = LinkedHashMap<String, Launch>()
+    private var generation = 0L
+
     @Synchronized
-    fun arm(requestIds: Collection<String>, nonce: String?, nowMillis: Long): List<String> {
-        val armed = requestIds.distinct()
-        armed.forEach {
-            // Taken out before being put back, so a repeated id counts as the
-            // newest entry instead of keeping the position of the launch it
-            // replaces. The cap below is documented to hold the most recent
-            // launches, and a plain overwrite leaves insertion order untouched.
-            launches.remove(it)
-            launches[it] = Launch(nowMillis, nonce)
+    fun pageGeneration(): Long = generation
+
+    @Synchronized
+    fun beginPage() {
+        generation++
+        launches.clear()
+    }
+
+    @Synchronized
+    fun register(requestId: String, nonce: String, documentId: String, pageGeneration: Long): Boolean {
+        val numericId = requestId.toLongOrNull() ?: return false
+        if (numericId <= 0 || numericId.toString() != requestId ||
+            !nonce.matches(Regex("[0-9a-f]{32}")) || !documentId.matches(Regex("[0-9a-f]{32}")) ||
+            pageGeneration != generation) return false
+        launches[requestId]?.let { return it.nonce == nonce && it.documentId == documentId }
+        if (launches.size >= MAX_TRACKED_SIGN_INS) return false
+        launches[requestId] = Launch(nonce, documentId)
+        return true
+    }
+
+    @Synchronized
+    fun arm(
+        requestIds: Collection<String>, nonce: String?, nowMillis: Long,
+        pageGeneration: Long = generation,
+    ): Attempt {
+        val records = if (pageGeneration != generation) emptyList() else requestIds.distinct()
+            .mapNotNull { launches[it] }.filter { !it.expired && it.nonce == nonce }
+        records.forEach {
+            if (it.at == null) it.at = nowMillis
+            it.outstanding++
         }
-        return armed
+        return Attempt(pageGeneration, records)
     }
 
-    /**
-     * Takes back launch records: the ids a launch armed when that launch then
-     * threw, and an id whose late arrival has already been explained.
-     *
-     * Arming has to happen before the launch (see the caller), so a launch that
-     * never happened had already opened the relay to the ids it named, and until
-     * the launch could report failure nothing could tell.
-     *
-     * Named apart from [arm] so it does not read as a second launch site:
-     * `ExtensionCallbackTest` counts arming calls against browser launches to
-     * catch a launch that forgets to arm, and a rollback spelled with the same
-     * name would be counted as an arming. The two call names are deliberately
-     * not written out here either -- that test strips comment lines before
-     * counting, but a guard that only stays correct because a neighbour
-     * filters prose is one bad refactor from a false count.
-     */
     @Synchronized
-    fun disarm(requestIds: Collection<String>) {
-        requestIds.forEach { launches.remove(it) }
+    fun launched(attempt: Attempt) = finish(attempt, true)
+
+    @Synchronized
+    fun disarm(attempt: Attempt) = finish(attempt, false)
+
+    private fun finish(attempt: Attempt, succeeded: Boolean) {
+        if (attempt.completed || attempt.generation != generation) return
+        attempt.completed = true
+        attempt.launches.forEach {
+            it.outstanding--
+            it.succeeded = it.succeeded || succeeded
+            if (it.outstanding == 0 && !it.succeeded) it.at = null
+        }
     }
 
-    /** When this app launched a browser for [requestId], or null if it never did. */
     @Synchronized
-    fun armedAt(requestId: String): Long? = launches[requestId]?.at
+    fun expire(requestId: String) {
+        launches[requestId]?.expired = true
+    }
 
-    /**
-     * The secret the address armed for [requestId] carried, or null when that
-     * launch carried none and when there was no such launch. The caller has
-     * already established which of those it is by asking [armedAt].
-     */
+    @Synchronized
+    fun armedAt(requestId: String): Long? = launches[requestId]?.takeUnless { it.expired }?.at
+
     @Synchronized
     fun nonceFor(requestId: String): String? = launches[requestId]?.nonce
 
-    /** Every launch reading held, for a caller asking whether any is still open. */
     @Synchronized
-    fun armedReadings(): List<Long> = launches.values.map { it.at }
+    fun documentIdFor(requestId: String): String? = launches[requestId]?.documentId
+
+    @Synchronized
+    fun armedReadings(): List<Long> = launches.values.filterNot { it.expired }.mapNotNull { it.at }
 }
 
 /**
@@ -674,6 +607,14 @@ class AndroidBridge(
      *   Android refuses outright rather than for want of an app.
      */
     @JavascriptInterface
+    fun registerAuthCallback(
+        requestId: String, nonce: String, documentId: String, pageGeneration: Long, authToken: String
+    ): Boolean {
+        if (!security.validateToken(authToken)) return false
+        return AuthTabWindow.register(requestId, nonce, documentId, pageGeneration)
+    }
+
+    @JavascriptInterface
     fun openExternalUrl(url: String, authToken: String): String {
         if (!security.validateToken(authToken)) return context.getString(OPEN_URL_STALE_SESSION)
         val address = encodeCallbackState(url)
@@ -681,7 +622,8 @@ class AndroidBridge(
         // the launch that armed them throws. Arming has to precede the launch, so
         // without this a launch nothing accepted still left the callback relay
         // open to those ids for ten minutes with no sign-in in flight.
-        var armed: List<String> = emptyList()
+        var armed: AuthTabWindow.Attempt? = null
+        val pageGeneration = AuthTabWindow.pageGeneration()
         return try {
             val uri = address.toUri()
             // The one destination this method judges, and it is refused before
@@ -726,7 +668,7 @@ class AndroidBridge(
             // as a sign-in did.
             armed = AuthTabWindow.arm(
                 authRequestIdsIn(address), authCallbackNonceIn(address),
-                SystemClock.elapsedRealtime(),
+                SystemClock.elapsedRealtime(), pageGeneration,
             )
             // Use system browser for localhost URLs (dev server preview needs full browser),
             // Chrome Custom Tabs for https (keeps user in-app, handles OAuth redirects).
@@ -742,9 +684,10 @@ class AndroidBridge(
                 }
                 context.startActivity(intent)
             }
+            AuthTabWindow.launched(armed)
             ""
         } catch (e: Exception) {
-            AuthTabWindow.disarm(armed)
+            armed?.let { AuthTabWindow.disarm(it) }
             // The URL is page supplied and this line is not gated on a debuggable
             // build, so it ships. That is the same reasoning [logToNative] gives,
             // and it carries here twice over: the workbench holds the connection

@@ -79,23 +79,11 @@ class AuthCallbackSecretTest {
         )
     }
 
-    /**
-     * An address this app opened without a secret in it is one it never had a
-     * secret for. Refusing there would take sign-in away from a flow whose callback
-     * URL this app could not read, which is worse than the matching that shipped
-     * before. It is not the other way round: a launch that carried a secret and a
-     * callback that arrives without one is the case above, and it is refused.
-     */
     @Test
-    fun `an address that carried no secret falls back to the older matching`() {
-        assertTrue(
-            callbackSecretMatches(null, null),
-            "a launch whose address carried no secret refused its own callback",
-        )
-        assertTrue(
-            callbackSecretMatches(null, ""),
-            "an empty secret refused every sign-in",
-        )
+    fun `an absent registered secret cannot authorize a callback`() {
+        assertFalse(callbackSecretMatches(null, null))
+        assertFalse(callbackSecretMatches(null, ""))
+        assertFalse(callbackSecretMatches(ours, null))
     }
 
     @Test
