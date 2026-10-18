@@ -2459,12 +2459,9 @@ runpy._run_module_as_main("pip")' "${'$'}__pip_errors" "${'$'}@" || __pip_status
 }
 pip3() { pip "${'$'}@"; }
 
-# A short note on the cause when an install fails for the reason this device
-# cannot fix.
-# There is no compiler here and none can run: SELinux refuses execve on anything
-# under filesDir, which is where a build would put its tools, so `pip install`
-# of a package with a compiled part walks to cmake and dies on EACCES with an
-# error that names cmake and not the device.
+# A short note when pip reports a failed build. The optional C/C++ toolchain
+# supports native builds, but packages may still need Android-compatible build
+# tools, dependencies or a prebuilt wheel. Pip's own error remains the diagnosis.
 #
 # The exit status cannot say which failure it was: pip returns 1 for a typo, a
 # network drop and a failed build alike. The records pip() kept can, so the note
@@ -2525,9 +2522,9 @@ __vscodroid_pip_explain() {
     [ -n "${'$'}{__VSCODROID_PIP_NOTED-}" ] && return 0
     grep -qE 'Failed building |metadata.generation.failed| when getting requirements to build' "${'$'}__errors" 2>/dev/null || return 0
     __VSCODROID_PIP_NOTED=1
-    echo "vscodroid: a package failed to build. If it has a part written in C, it cannot" >&2
-    echo "vscodroid: be built here: this device has no C compiler and cannot run one." >&2
-    echo "vscodroid: Pure Python packages install." >&2
+    echo "vscodroid: a package failed to build. Native builds may need the optional C/C++ toolchain" >&2
+    echo "vscodroid: and Android-compatible dependencies, or a compatible prebuilt wheel." >&2
+    echo "vscodroid: Check pip's error output for the cause." >&2
     echo "vscodroid: https://rmyndharis.github.io/VSCodroid/guide.html#python-packages-written-in-c" >&2
 }
 """
@@ -2536,9 +2533,10 @@ __vscodroid_pip_explain() {
      * Points pip at the wheels this project mirrors, and at nothing else.
      *
      * The device's interpreter accepts `cp314-cp314-android_24_arm64_v8a` and
-     * PyPI publishes almost nothing for it, so `pip install pandas` falls back
-     * to the sdist and dies at cmake: there is no compiler here and SELinux
-     * refuses to execve one from filesDir. The wheels exist, prebuilt, and
+     * PyPI publishes almost nothing for it, so `pip install pandas` can fall back
+     * to an sdist that requires additional native tools and dependencies. The
+     * optional C/C++ toolchain does not supply every package's build environment.
+     * The wheels exist, prebuilt, and
      * `wheelhouse.json` names the ones we mirror; this is the line that makes
      * pip look at them.
      *
@@ -2615,7 +2613,7 @@ __vscodroid_pip_explain() {
      * launch after an app update, with no re-extraction and nothing moving in
      * the storage pre-flight.
      */
-    private val pipBlockMarker = "__vscodroid_pip_explain()"
+    private val pipBlockMarker = "Native builds may need the optional C/C++ toolchain"
 
     /** The comment every pip block this app has written opens with, v1.3.0's included. */
     private val PIP_BLOCK_HEADER = "# pip/pip3: shell functions."
