@@ -16,11 +16,13 @@ import io.mockk.unmockkAll
 import io.mockk.verify
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 
 /**
  * What happens when a create arrives for a name the device folder already has.
@@ -41,6 +43,9 @@ class SafCreateIdempotencyTest {
 
     @TempDir
     lateinit var workspace: File
+
+    @TempDir
+    lateinit var filesDir: File
 
     private lateinit var engine: SafSyncEngine
     private lateinit var resolver: ContentResolver
@@ -76,6 +81,7 @@ class SafCreateIdempotencyTest {
 
         val context = mockk<Context>(relaxed = true)
         every { context.contentResolver } returns resolver
+        every { context.filesDir } returns filesDir
         engine = SafSyncEngine(context)
     }
 
@@ -106,6 +112,56 @@ class SafCreateIdempotencyTest {
             .single { it.name == "createInSaf" }
             .apply { isAccessible = true }
             .invoke(engine, localFile, parentUri, treeUri, null)
+    }
+
+    @Test
+    fun `a refused create retires intent when its local file vanished`() {
+        assertVanishedCreationRetiresIntent("null")
+    }
+
+    @Test
+    fun `a throwing create retires intent when its local file vanished`() {
+        assertVanishedCreationRetiresIntent("throw")
+    }
+
+    @Test
+    fun `an accepted create retires intent when its local file vanished`() {
+        assertVanishedCreationRetiresIntent("accepted")
+    }
+
+    private fun assertVanishedCreationRetiresIntent(outcome: String) {
+        every { resolver.query(childrenUri, any(), any(), any(), any()) } returns folderHolding()
+        val other = File(workspace, "other.txt").apply { writeText("another pending edit") }
+        val journal = File(filesDir, SafSyncEngine.UPLOADS_IN_FLIGHT_FILE)
+        journal.writeText(other.absolutePath)
+        every { DocumentsContract.createDocument(any(), any(), any(), any()) } answers {
+            assertTrue(File(workspace, "notes.txt").delete())
+            when (outcome) {
+                "null" -> null
+                "throw" -> throw IOException("provider unavailable")
+                else -> createdUri
+            }
+        }
+
+        create("notes.txt", "the only copy")
+
+        assertEquals(listOf(other.absolutePath), journal.readLines())
+        assertEquals("another pending edit", other.readText())
+    }
+
+    @Test
+    fun `a refused create retains intent while its local file survives`() {
+        every { resolver.query(childrenUri, any(), any(), any(), any()) } returns folderHolding()
+        every { DocumentsContract.createDocument(any(), any(), any(), any()) } returns null
+
+        create("notes.txt", "the only copy")
+
+        val local = File(workspace, "notes.txt")
+        assertEquals("the only copy", local.readText())
+        assertEquals(
+            listOf(local.absolutePath),
+            File(filesDir, SafSyncEngine.UPLOADS_IN_FLIGHT_FILE).readLines(),
+        )
     }
 
     @Test

@@ -57,6 +57,9 @@ class SafDirectoryRenameTest {
     @TempDir
     lateinit var mirror: File
 
+    @TempDir
+    lateinit var filesDir: File
+
     private lateinit var resolver: ContentResolver
     private lateinit var engine: SafSyncEngine
     private lateinit var treeUri: Uri
@@ -82,6 +85,7 @@ class SafDirectoryRenameTest {
         resolver = mockk(relaxed = true)
         val context = mockk<Context>(relaxed = true)
         every { context.contentResolver } returns resolver
+        every { context.filesDir } returns filesDir
         engine = SafSyncEngine(context)
         treeUri = mockk(relaxed = true)
         // The state a sync leaves the cache in for the folder being watched. Without it
