@@ -45,6 +45,7 @@ class SafDataPreservationInstrumentedTest {
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION))
         sandbox = File(target.cacheDir, "saf-preservation-${System.nanoTime()}")
         context = object : ContextWrapper(target) {
+            override fun getApplicationContext(): Context = this
             override fun getFilesDir(): File = File(sandbox, "files").apply { mkdirs() }
             override fun getCacheDir(): File = File(sandbox, "cache").apply { mkdirs() }
         }
@@ -294,6 +295,40 @@ class SafDataPreservationInstrumentedTest {
     private fun directoryBytes(newChild: Boolean = false): ByteArray = requireNotNull(
         control("directoryRead", Bundle().apply { putBoolean("newChild", newChild) }).getByteArray("bytes"),
     )
+
+    @Test
+    fun unrecordedPartialFileSurvivesRevokedMirrorCleanup() = runBlocking {
+        val manager = SafStorageManager(context)
+        val savedMirror = manager.getMirrorDir(treeUri)
+        engine.initialSync(treeUri, savedMirror) { _, _ -> }
+        val record = File(savedMirror.path + SafSyncEngine.SYNCED_RECORD_SUFFIX)
+        val originalRecord = record.readBytes()
+        val local = File(savedMirror, "workspace-notes" + SafSyncEngine.PARTIAL_SUFFIX)
+        local.writeBytes(EDITED)
+        fixtureGrant(SafProviderGrantReceiver.REVOKE)
+        assertEquals(PackageManager.PERMISSION_DENIED, context.checkUriPermission(
+            treeUri, Process.myPid(), Process.myUid(), Intent.FLAG_GRANT_READ_URI_PERMISSION,
+        ))
+
+        assertEquals(0, manager.reclaimRevokedMirrorsSync())
+
+        assertArrayEquals(EDITED, local.readBytes())
+        assertArrayEquals(originalRecord, record.readBytes())
+    }
+
+    @Test
+    fun recordedMirrorIsReclaimedAfterItsGrantIsRevoked() = runBlocking {
+        val manager = SafStorageManager(context)
+        val savedMirror = manager.getMirrorDir(treeUri)
+        engine.initialSync(treeUri, savedMirror) { _, _ -> }
+        assertArrayEquals(ORIGINAL, File(savedMirror, SafDocumentsProvider.FILE_NAME).readBytes())
+        fixtureGrant(SafProviderGrantReceiver.REVOKE)
+
+        assertTrue(manager.reclaimRevokedMirrorsSync() > 0)
+
+        assertFalse(savedMirror.exists())
+        assertFalse(File(savedMirror.path + SafSyncEngine.SYNCED_RECORD_SUFFIX).exists())
+    }
 
     private fun providerBytes(): ByteArray = requireNotNull(control("read").getByteArray("bytes"))
 
