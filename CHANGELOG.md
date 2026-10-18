@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Device-folder imports preserve local edits made while the provider is being read.
 - Device-folder saves preserve both copies and report a failure when the upload recovery record cannot be written.
 - Device-folder sync preserves local edits when a conflicting device copy cannot be kept and protects documents in directories the provider could not list.
 - Reopening a device folder rejects stale saves, deletes and watcher callbacks from the previous sync.

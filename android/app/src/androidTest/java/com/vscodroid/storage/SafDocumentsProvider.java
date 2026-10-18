@@ -15,6 +15,8 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /** A real provider whose documents exist only in the instrumentation APK's storage. */
@@ -25,6 +27,8 @@ public final class SafDocumentsProvider extends DocumentsProvider {
 
     private final AtomicInteger writeOpens = new AtomicInteger();
     private final AtomicInteger createCalls = new AtomicInteger();
+    private volatile CountDownLatch readEntered = new CountDownLatch(1);
+    private volatile CountDownLatch readRelease = new CountDownLatch(0);
 
     @Override
     public boolean onCreate() {
@@ -91,13 +95,27 @@ public final class SafDocumentsProvider extends DocumentsProvider {
     public ParcelFileDescriptor openDocument(String documentId, String mode, CancellationSignal signal)
             throws FileNotFoundException {
         if (!FILE_NAME.equals(documentId)) throw new FileNotFoundException(documentId);
-        if (mode.contains("w")) writeOpens.incrementAndGet();
+        if (mode.contains("w")) {
+            writeOpens.incrementAndGet();
+        } else {
+            CountDownLatch release = readRelease;
+            readEntered.countDown();
+            try {
+                if (!release.await(15, TimeUnit.SECONDS)) {
+                    throw new FileNotFoundException("The fixture read was not released");
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new FileNotFoundException("The fixture read was interrupted");
+            }
+        }
         return ParcelFileDescriptor.open(document(), ParcelFileDescriptor.parseMode(mode));
     }
 
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
-        if (!"reset".equals(method) && !"read".equals(method) && !"stats".equals(method)) {
+        if (!"reset".equals(method) && !"read".equals(method) && !"stats".equals(method)
+                && !"blockRead".equals(method) && !"releaseRead".equals(method)) {
             return super.call(method, arg, extras);
         }
         try {
@@ -110,6 +128,9 @@ public final class SafDocumentsProvider extends DocumentsProvider {
             Bundle result = new Bundle();
             switch (method) {
                 case "reset":
+                    readRelease.countDown();
+                    readRelease = new CountDownLatch(0);
+                    readEntered = new CountDownLatch(1);
                     File directory = file.getParentFile();
                     if (!directory.isDirectory() && !directory.mkdirs()) {
                         throw new IOException("Cannot create test document directory");
@@ -127,7 +148,15 @@ public final class SafDocumentsProvider extends DocumentsProvider {
                 case "read":
                     result.putByteArray("bytes", Files.readAllBytes(file.toPath()));
                     break;
+                case "blockRead":
+                    readEntered = new CountDownLatch(1);
+                    readRelease = new CountDownLatch(1);
+                    break;
+                case "releaseRead":
+                    readRelease.countDown();
+                    break;
                 case "stats":
+                    result.putBoolean("readBlocked", readEntered.getCount() == 0 && readRelease.getCount() > 0);
                     result.putInt("writeOpens", writeOpens.get());
                     result.putInt("createCalls", createCalls.get());
                     result.putBoolean("exists", file.isFile());

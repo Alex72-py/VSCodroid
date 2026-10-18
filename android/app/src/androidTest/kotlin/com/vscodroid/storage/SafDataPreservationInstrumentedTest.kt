@@ -21,6 +21,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
 
 @RunWith(AndroidJUnit4::class)
@@ -157,6 +158,47 @@ class SafDataPreservationInstrumentedTest {
         engine.initialSync(treeUri, reopened) { _, _ -> }
         assertArrayEquals(EDITED, File(reopened, SafDocumentsProvider.FILE_NAME).readBytes())
         assertArrayEquals(EDITED, providerBytes())
+    }
+
+    @Test
+    fun localEditDuringProviderReadSurvivesReopeningWithBothVersions() {
+        val local = File(mirror, SafDocumentsProvider.FILE_NAME)
+        val oldTime = 1_600_000_000_000L
+        local.writeBytes(ByteArray(ORIGINAL.size) { 'a'.code.toByte() })
+        assertTrue(local.setLastModified(oldTime))
+        File(mirror.path + SafSyncEngine.SYNCED_RECORD_SUFFIX).writeText(
+            SafSyncEngine.RECORD_HEADER + "\n${local.name}\t$oldTime\t${ORIGINAL.size}\n",
+        )
+        val intervening = ByteArray(ORIGINAL.size) { 'b'.code.toByte() }
+        val failure = AtomicReference<Throwable>()
+        control("blockRead")
+        val worker = Thread {
+            try {
+                runBlocking { engine.initialSync(treeUri, mirror) { _, _ -> } }
+            } catch (error: Throwable) {
+                failure.set(error)
+            }
+        }.apply { start() }
+        try {
+            assertTrue("The provider never blocked its read", await { control("stats").getBoolean("readBlocked") })
+            local.writeBytes(intervening)
+            assertTrue(local.setLastModified(oldTime))
+        } finally {
+            control("releaseRead")
+            worker.join(10_000)
+        }
+        assertFalse("The incoming copy did not finish", worker.isAlive)
+        failure.get()?.let { throw AssertionError("The incoming copy failed", it) }
+        assertArrayEquals(ORIGINAL, local.readBytes())
+        val preserved = mirror.listFiles()!!.filter { it.name.startsWith(local.name + SafSyncEngine.LOCAL_COPY_SUFFIX) }
+        assertEquals("The intervening edit needs one preserved copy", 1, preserved.size)
+        assertArrayEquals(intervening, preserved.single().readBytes())
+        assertArrayEquals(ORIGINAL, providerBytes())
+
+        runBlocking { SafSyncEngine(context).initialSync(treeUri, mirror) { _, _ -> } }
+        assertArrayEquals(ORIGINAL, local.readBytes())
+        assertArrayEquals(intervening, preserved.single().readBytes())
+        assertEquals("Reopening created another conflict copy", 2, mirror.listFiles()!!.size)
     }
 
     private fun providerBytes(): ByteArray = requireNotNull(control("read").getByteArray("bytes"))
