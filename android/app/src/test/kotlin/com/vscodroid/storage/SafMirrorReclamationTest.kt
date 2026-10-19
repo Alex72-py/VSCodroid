@@ -208,38 +208,41 @@ class SafMirrorReclamationTest {
         assertTrue(removed > 0)
     }
 
-    /**
-     * The copy the sync writes beside its destination and renames into place, left where
-     * it fell by a process death mid-copy.
-     *
-     * Nothing names that file again once the document it was fetching is renamed or
-     * deleted on the device: no record can carry it, the deletion pass visits only paths
-     * a record names, and every removal here works on whole mirrors. So one orphan
-     * answered the vouching walk false for the life of the install, and the user was told
-     * a half-written scratch file was work their device folder did not have, on a mirror
-     * they could then only remove through the forced path that says the same thing.
-     */
     @Test
-    fun `a mirror holding this app's own abandoned scratch file is reclaimed`() {
-        val (staleDir, _) = mirrorFor(revokedUri)
+    fun `an unrecorded workspace file with the partial suffix keeps its mirror`() {
+        val (staleDir, record) = mirrorFor(revokedUri)
         mirrorFor(liveUri)
-        File(staleDir, "src/video.mp4" + SafSyncEngine.PARTIAL_SUFFIX)
-            .writeText("as far as the copy got before the process died")
+        val originalRecord = record.readText()
+        val local = File(staleDir, "src/notes.txt" + SafSyncEngine.PARTIAL_SUFFIX)
+        val uniqueBytes = "workspace bytes absent from the device folder"
+        local.writeText(uniqueBytes)
         every { resolver.persistedUriPermissions } returns listOf(permissionFor(liveUri))
 
         val removed = manager.reclaimRevokedMirrorsSync()
 
-        assertFalse(
-            staleDir.exists(),
-            "a mirror the device folder holds every byte of was kept for good over this " +
-                "app's own half-written copy of one of those bytes",
-        )
+        assertTrue(staleDir.isDirectory, "the suffix was treated as proof of a disposable copy")
+        assertEquals(uniqueBytes, local.readText())
+        assertEquals(originalRecord, record.readText())
+        assertEquals(0, removed)
+    }
+
+    @Test
+    fun `a recorded file with the partial suffix follows the ordinary reclaim gate`() {
+        val (staleDir, record) = mirrorFor(revokedUri)
+        mirrorFor(liveUri)
+        val local = File(staleDir, "src/notes.txt" + SafSyncEngine.PARTIAL_SUFFIX)
+            .apply { writeText("a copy the device already holds") }
+        record.appendText("\n" + SafSyncEngine(context).identityLine("src/" + local.name, local))
+        every { resolver.persistedUriPermissions } returns listOf(permissionFor(liveUri))
+
+        val removed = manager.reclaimRevokedMirrorsSync()
+
+        assertFalse(staleDir.exists(), "a recorded copy was kept solely because of its suffix")
+        assertFalse(record.exists())
         assertTrue(removed > 0)
     }
 
     /**
-     * How narrow that exemption has to be, in the case that must not be swept into it.
-     *
      * `.tmp` and `~` are temporary to the writer that made them and nothing else, and
      * the write-back declines both names, so a file a terminal left in the mirror under
      * one is on no device folder anywhere. It is the user's only copy, and reclaiming
