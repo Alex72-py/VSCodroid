@@ -57,6 +57,9 @@ class SafDirectoryRenameTest {
     @TempDir
     lateinit var mirror: File
 
+    @TempDir
+    lateinit var filesDir: File
+
     private lateinit var resolver: ContentResolver
     private lateinit var engine: SafSyncEngine
     private lateinit var treeUri: Uri
@@ -82,6 +85,7 @@ class SafDirectoryRenameTest {
         resolver = mockk(relaxed = true)
         val context = mockk<Context>(relaxed = true)
         every { context.contentResolver } returns resolver
+        every { context.filesDir } returns filesDir
         engine = SafSyncEngine(context)
         treeUri = mockk(relaxed = true)
         // The state a sync leaves the cache in for the folder being watched. Without it
@@ -772,7 +776,7 @@ class SafDirectoryRenameTest {
         // easy over-correction: a folder the user removes in the editor would come
         // straight back the next time the folder is opened, because reopening copies
         // the device tree down again.
-        deviceFolderHolding("util")
+        deviceTree { parent -> if (parent == "root") listOf("util") else emptyList() }
 
         deliver(FileObserver.DELETE or isDirFlag, "util")
 

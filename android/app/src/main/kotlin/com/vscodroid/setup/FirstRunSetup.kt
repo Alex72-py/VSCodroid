@@ -3481,8 +3481,12 @@ claude() {
 
         val present = extensionsDir.list()?.toList() ?: emptyList()
         val superseded = supersededExtensionDirs(present, bundled.toList())
+        val elsewhere = otherProfilesExtensionDirs()
+        var removedSuperseded = 0
         for (name in superseded) {
+            if (elsewhere == null || name in elsewhere) continue
             if (removeExtensionDir(File(extensionsDir, name))) {
+                removedSuperseded++
                 Logger.i(tag, "Removed superseded bundled extension: $name")
             }
         }
@@ -3529,8 +3533,9 @@ claude() {
         // The disk is read again here, after every sweep above, because the rule
         // asks whether the user's copy is on disk NOW; and nothing is removed
         // unless every profile's manifest could be read.
-        val listed = manifestEntryDirs(manifestFile)
-        val elsewhere = otherProfilesExtensionDirs()
+        // Superseded default entries will be replaced even when another profile
+        // needs the old directory, so they cannot make the new copy an orphan.
+        val listed = manifestEntryDirs(manifestFile)?.filterNot { it.second in superseded }
         if (listed != null && elsewhere != null) {
             val onDisk = extensionsDir.list()?.toList() ?: emptyList()
             for (name in orphanedBundledCopies(onDisk, bundled.toList(), listed, elsewhere)) {
@@ -3562,13 +3567,13 @@ claude() {
             // every bundled extension as new.
             rememberBundledIds(bundledIds)
         } else {
-            reconcileExtensionsManifest(manifestFile, extensionsDir, bundled, bundledIds)
+            reconcileExtensionsManifest(manifestFile, extensionsDir, bundled, bundledIds, superseded)
         }
 
         // Reports the decision. Reaching this line now also means every one of
         // those unpacks succeeded, since the loop above throws otherwise.
         Logger.i(tag, "Bundled extensions: ${toExtract.size} of ${bundled.size} needed unpacking, " +
-            "${superseded.size} superseded removed")
+            "$removedSuperseded superseded removed")
     }
 
     /**
@@ -3588,7 +3593,7 @@ claude() {
      *
      * The directory is read the way [reconcileExtensionsManifest] reads it; an
      * entry that names none carries "". Null for a missing or unparseable file,
-     * because the one caller deletes on the strength of what this lists.
+     * because callers delete on the strength of what this lists.
      */
     private fun manifestEntryDirs(manifestFile: File): List<Pair<String, String>>? {
         if (!manifestFile.isFile) return null
@@ -3620,13 +3625,15 @@ claude() {
      */
     private fun otherProfilesExtensionDirs(): Set<String>? {
         val profilesDir = File(Environment.getUserDataDir(context), "data/User/profiles")
-        if (!profilesDir.exists()) return emptySet()
+        if (Files.notExists(profilesDir.toPath())) return emptySet()
         val profiles = profilesDir.listFiles() ?: return null
         val dirs = mutableSetOf<String>()
         for (profile in profiles) {
             val manifest = File(profile, "extensions.json")
-            if (!manifest.exists()) continue
-            dirs += (manifestEntryDirs(manifest) ?: return null).map { it.second }
+            if (Files.notExists(manifest.toPath())) continue
+            val entries = manifestEntryDirs(manifest) ?: return null
+            if (entries.any { it.second.isEmpty() }) return null
+            dirs += entries.map { it.second }
         }
         return dirs
     }
@@ -3775,8 +3782,9 @@ claude() {
     /**
      * Brings the manifest back in line with the directories after an upgrade
      * swapped bundled extension versions underneath it. Conservative on
-     * purpose: an entry survives unless its directory is verifiably gone, and a
-     * bundled directory is only added to replace an entry that was just
+     * purpose: an entry survives unless its directory is verifiably gone or a
+     * bundled upgrade supersedes it. An older directory may still be needed by
+     * another profile. A bundled directory is only added to replace an entry just
      * dropped, never for an identifier with no entry at all, which is an
      * extension the user uninstalled, nor over a surviving entry, so a user's
      * own newer install keeps winning over the bundled copy.
@@ -3786,6 +3794,7 @@ claude() {
         extensionsDir: File,
         bundledDirs: Array<String>,
         bundledIds: List<String>,
+        supersededDirs: List<String>,
     ) {
         try {
             val entries = JSONArray(manifestFile.readText())
@@ -3799,7 +3808,9 @@ claude() {
                 val path = entry.optJSONObject("location")?.optString("path").orEmpty()
                 val dirName = entry.optString("relativeLocation")
                     .ifEmpty { if (path.isEmpty()) "" else File(path).name }
-                if (dirName.isNotEmpty() && !File(extensionsDir, dirName).exists()) {
+                if (dirName in supersededDirs ||
+                    (dirName.isNotEmpty() && !File(extensionsDir, dirName).exists())
+                ) {
                     dropped++
                     entry.optJSONObject("identifier")?.optString("id")?.let { droppedIds.add(it) }
                     continue

@@ -14,9 +14,12 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.io.ByteArrayInputStream
 import java.io.File
 
@@ -140,5 +143,123 @@ class OrphanedBundledSweepTest {
         extractBundledExtensions()
 
         assertTrue(File(extensionsDir, bundledDir).isDirectory, "deleted without knowing what the profile lists")
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a version bump preserves another profile's copy while updating the default`(pathOnly: Boolean) {
+        val oldDir = "ms-python.python-2026.3.0"
+        val old = installedDir(oldDir, "2026.3.0")
+        File(old, "extension.js").writeText("previous extension")
+        manifest.writeText("[${entry(oldDir, "2026.3.0")}]")
+        val profileEntry = if (pathOnly) {
+            org.json.JSONObject(entry(oldDir, "2026.3.0")).apply { remove("relativeLocation") }.toString()
+        } else {
+            entry(oldDir, "2026.3.0")
+        }
+        val profileManifest = File(profiles, "5f3a").apply { mkdirs() }.resolve("extensions.json")
+        val profileContent = "[$profileEntry]"
+        profileManifest.writeText(profileContent)
+
+        extractBundledExtensions()
+
+        assertTrue(old.isDirectory, "the named profile's extension was deleted")
+        assertEquals("previous extension", File(old, "extension.js").readText())
+        assertEquals(profileContent, profileManifest.readText())
+        assertTrue(File(extensionsDir, "$bundledDir/package.json").isFile)
+        assertEquals(listOf(bundledDir), listedDirs())
+
+        profileManifest.writeText("[]")
+        extractBundledExtensions()
+
+        assertFalse(old.exists(), "the unreferenced older copy was never reclaimed")
+        assertEquals(listOf(bundledDir), listedDirs())
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["[{truncated", "[{}]", "[{\"identifier\":{\"id\":\"ms-python.python\"}}]"])
+    fun `unknown profile references preserve superseded copies`(profileContent: String) {
+        val oldDir = "ms-python.python-2026.3.0"
+        val old = installedDir(oldDir, "2026.3.0")
+        manifest.writeText("[${entry(oldDir, "2026.3.0")}]")
+        val profileManifest = File(profiles, "5f3a").apply { mkdirs() }.resolve("extensions.json")
+        profileManifest.writeText(profileContent)
+
+        extractBundledExtensions()
+
+        assertTrue(old.isDirectory, "deleted while the profile's references were unknown")
+        assertEquals(profileContent, profileManifest.readText())
+        assertEquals(listOf(bundledDir), listedDirs())
+        assertTrue(File(extensionsDir, "$bundledDir/package.json").isFile)
+    }
+
+    @Test
+    fun `an unreadable profile manifest preserves superseded copies`() {
+        val oldDir = "ms-python.python-2026.3.0"
+        val old = installedDir(oldDir, "2026.3.0")
+        manifest.writeText("[${entry(oldDir, "2026.3.0")}]")
+        File(profiles, "5f3a/extensions.json").mkdirs()
+
+        extractBundledExtensions()
+
+        assertTrue(old.isDirectory)
+        assertEquals(listOf(bundledDir), listedDirs())
+    }
+
+    @Test
+    fun `an unreadable profiles directory preserves superseded copies`() {
+        val oldDir = "ms-python.python-2026.3.0"
+        val old = installedDir(oldDir, "2026.3.0")
+        manifest.writeText("[${entry(oldDir, "2026.3.0")}]")
+        profiles.parentFile.mkdirs()
+        profiles.writeText("not a directory")
+
+        extractBundledExtensions()
+
+        assertTrue(old.isDirectory)
+        assertEquals(listOf(bundledDir), listedDirs())
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a profile that cannot be searched preserves its hidden references`(hideProfilesRoot: Boolean) {
+        val oldDir = "ms-python.python-2026.3.0"
+        val old = installedDir(oldDir, "2026.3.0")
+        manifest.writeText("[${entry(oldDir, "2026.3.0")}]")
+        val profile = File(profiles, "5f3a").apply { mkdirs() }
+        val profileManifest = File(profile, "extensions.json")
+        profileManifest.writeText("[${entry(oldDir, "2026.3.0")}]")
+        val protectedDir = if (hideProfilesRoot) profiles.parentFile else profile
+        try {
+            protectedDir.setExecutable(false, false)
+            assumeFalse(profileManifest.exists(), "this host can still search the protected profile")
+
+            extractBundledExtensions()
+
+            assertTrue(old.isDirectory, "an inaccessible manifest was treated as absent")
+            assertEquals(listOf(bundledDir), listedDirs())
+        } finally {
+            protectedDir.setExecutable(true, true)
+        }
+    }
+
+    @Test
+    fun `a pinned older gallery default stays selected during a bundled upgrade`() {
+        val pinnedDir = "ms-python.python-2026.1.0-universal"
+        installedDir(pinnedDir, "2026.1.0")
+        val pinned = org.json.JSONObject(entry(pinnedDir, "2026.1.0"))
+            .put("metadata", org.json.JSONObject().put("pinned", true)).toString()
+        manifest.writeText("[$pinned]")
+        val oldDir = "ms-python.python-2026.3.0"
+        val old = installedDir(oldDir, "2026.3.0")
+        File(profiles, "5f3a").apply { mkdirs() }
+            .resolve("extensions.json").writeText("[${entry(oldDir, "2026.3.0")}]")
+
+        extractBundledExtensions()
+
+        assertTrue(old.isDirectory)
+        assertTrue(File(extensionsDir, "$pinnedDir/package.json").isFile)
+        assertEquals(listOf(pinnedDir), listedDirs())
+        assertTrue(JSONArray(manifest.readText()).getJSONObject(0).getJSONObject("metadata").getBoolean("pinned"))
     }
 }

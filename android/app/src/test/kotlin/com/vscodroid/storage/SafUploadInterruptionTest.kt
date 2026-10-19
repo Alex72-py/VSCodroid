@@ -17,6 +17,7 @@ import io.mockk.unmockkAll
 import io.mockk.verify
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -33,6 +34,8 @@ import kotlin.concurrent.thread
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
 
 /**
  * What an interrupted upload leaves behind, and what the next sync does with it.
@@ -132,6 +135,201 @@ class SafUploadInterruptionTest {
     private fun deliver(event: Int, entry: String) {
         engine.handleMirrorEvent(event, File(mirror, entry), mirror, treeUri)
         engine.runWriteBackLoop { false }
+    }
+
+    @Test
+    fun `an unavailable journal refuses truncation and permits a later retry`() {
+        assertUnavailableJournalRefusesUpload(journal)
+    }
+
+    @Test
+    fun `an unavailable journal refuses creation of an empty device file`() {
+        assertUnavailableJournalRefusesCreation(FileObserver.CREATE)
+    }
+
+    @Test
+    fun `an unavailable journal refuses creation for an unknown modified file`() {
+        assertUnavailableJournalRefusesCreation(FileObserver.MODIFY)
+    }
+
+    private fun assertUnavailableJournalRefusesCreation(event: Int) {
+        deviceHolding("other.txt")
+        val localBytes = byteArrayOf(0, 1, 2, -1, 10, 42)
+        val local = File(mirror, "notes.txt").apply { writeBytes(localBytes) }
+        val created = mutableListOf<String>()
+        every { DocumentsContract.createDocument(any(), any(), any(), any()) } answers {
+            created.add(arg(3))
+            uris.getOrPut("doc:notes.txt") { mockk(relaxed = true) }
+        }
+        val device = ByteArrayOutputStream()
+        every { resolver.openOutputStream(any(), "wt") } returns device
+        val failed = mutableListOf<File>()
+        engine.onWriteBackFailed = { failed.add(it) }
+        assertTrue(journal.mkdir())
+        File(journal, "occupied").writeText("keep")
+
+        deliver(event, local.name)
+
+        assertTrue(created.isEmpty(), "a refused save left an empty provider document")
+        verify(exactly = 0) { resolver.openOutputStream(any(), any()) }
+        assertArrayEquals(localBytes, local.readBytes())
+        assertEquals(listOf(local), failed)
+
+        every { resolver.query(any(), any(), any(), any(), any()) } returns
+            mockk<Cursor>(relaxed = true) { every { moveToNext() } returns false }
+        engine = SafSyncEngine(context).also { it.onWriteBackFailed = { file -> failed.add(file) } }
+        runBlocking { engine.initialSync(treeUri, mirror) { _, _ -> } }
+        assertArrayEquals(localBytes, local.readBytes())
+        assertTrue(created.isEmpty())
+
+        assertTrue(journal.deleteRecursively())
+        deliver(event, local.name)
+
+        assertEquals(listOf("notes.txt"), created)
+        assertArrayEquals(localBytes, device.toByteArray())
+        assertArrayEquals(localBytes, local.readBytes())
+        assertEquals(listOf(local), failed)
+        assertFalse(journal.exists())
+    }
+
+    @Test
+    fun `an unavailable journal temporary file preserves existing recovery records`() {
+        val other = File(filesDir, "other-mirror/other.txt").apply {
+            parentFile!!.mkdirs()
+            writeText("another pending edit")
+        }
+        journal.writeText(other.absolutePath)
+
+        assertUnavailableJournalRefusesUpload(
+            File(filesDir, SafSyncEngine.UPLOADS_IN_FLIGHT_FILE + SafSyncEngine.PARTIAL_SUFFIX),
+            listOf(other.absolutePath),
+        )
+    }
+
+    private fun assertUnavailableJournalRefusesUpload(
+        blocked: File,
+        previousRecords: List<String> = emptyList(),
+    ) {
+        deviceHolding("notes.txt")
+        val localBytes = byteArrayOf(0, 1, 2, -1, 10, 42)
+        val local = File(mirror, "notes.txt").apply { writeBytes(localBytes) }
+        val device = ByteArrayOutputStream().apply { write("device original".toByteArray()) }
+        val failed = mutableListOf<File>()
+        engine.onWriteBackFailed = { failed.add(it) }
+        every { resolver.openOutputStream(any(), "wt") } answers {
+            device.reset()
+            device
+        }
+        assertTrue(blocked.mkdir())
+        File(blocked, "occupied").writeText("keep")
+
+        deliver(FileObserver.MODIFY, local.name)
+
+        assertEquals("device original", device.toString(Charsets.UTF_8.name()))
+        verify(exactly = 0) { resolver.openOutputStream(any(), any()) }
+        assertArrayEquals(localBytes, local.readBytes())
+        assertEquals(listOf(local), failed)
+        if (previousRecords.isNotEmpty()) assertEquals(previousRecords, journal.readLines())
+
+        assertTrue(blocked.deleteRecursively())
+        deliver(FileObserver.MODIFY, local.name)
+
+        assertArrayEquals(localBytes, device.toByteArray())
+        assertArrayEquals(localBytes, local.readBytes())
+        assertEquals(listOf(local), failed)
+        assertEquals(previousRecords, if (journal.isFile) journal.readLines() else emptyList())
+    }
+
+    @Test
+    fun `a refused atomic journal replacement preserves every recovery record`() {
+        deviceHolding("notes.txt")
+        val local = File(mirror, "notes.txt").apply { writeText("the whole edit") }
+        val other = File(filesDir, "other.txt").apply { writeText("another pending edit") }
+        val original = "${other.absolutePath}\n".toByteArray()
+        journal.writeBytes(original)
+        val temporary = File(filesDir, journal.name + SafSyncEngine.PARTIAL_SUFFIX)
+            .apply { writeText("existing temporary file") }
+        val probe = File(filesDir, "rename-probe").apply { writeText("probe") }
+        val failed = mutableListOf<File>()
+        engine.onWriteBackFailed = { failed.add(it) }
+        val device = ByteArrayOutputStream().apply { write("device original".toByteArray()) }
+        every { resolver.openOutputStream(any(), "wt") } answers {
+            device.reset()
+            device
+        }
+        val permissions = Files.getPosixFilePermissions(filesDir.toPath())
+        val writePermissions = setOf(
+            PosixFilePermission.OWNER_WRITE,
+            PosixFilePermission.GROUP_WRITE,
+            PosixFilePermission.OTHERS_WRITE,
+        )
+        try {
+            Files.setPosixFilePermissions(filesDir.toPath(), permissions - writePermissions)
+            assertFalse(probe.renameTo(File(filesDir, "rename-target")))
+            // Existing files remain writable even though their directory refuses renames.
+            journal.writeBytes(original)
+            temporary.writeText("still writable")
+            assertEquals("still writable", temporary.readText())
+
+            deliver(FileObserver.MODIFY, local.name)
+
+            assertArrayEquals(original, journal.readBytes())
+            assertEquals("device original", device.toString(Charsets.UTF_8.name()))
+            verify(exactly = 0) { resolver.openOutputStream(any(), any()) }
+            assertEquals("the whole edit", local.readText())
+            assertEquals(listOf(local), failed)
+        } finally {
+            Files.setPosixFilePermissions(filesDir.toPath(), permissions)
+        }
+    }
+
+    @Test
+    fun `an existing recovery record permits a write without rewriting the journal`() {
+        deviceHolding("notes.txt")
+        val local = File(mirror, "notes.txt").apply { writeText("the whole edit") }
+        journal.writeText(local.absolutePath)
+        val blocked = File(filesDir, SafSyncEngine.UPLOADS_IN_FLIGHT_FILE + SafSyncEngine.PARTIAL_SUFFIX)
+        assertTrue(blocked.mkdir())
+        File(blocked, "occupied").writeText("keep")
+        val device = ByteArrayOutputStream()
+        every { resolver.openOutputStream(any(), "wt") } returns device
+
+        deliver(FileObserver.MODIFY, local.name)
+
+        assertEquals("the whole edit", device.toString(Charsets.UTF_8.name()))
+        assertFalse(journal.exists())
+    }
+
+    @Test
+    fun `a failed journal retirement does not report a landed write as failed`() {
+        deviceHolding("notes.txt")
+        val local = File(mirror, "notes.txt").apply { writeText("the whole edit") }
+        val other = File(filesDir, "other-mirror/other.txt").apply {
+            parentFile!!.mkdirs()
+            writeText("another pending edit")
+        }
+        journal.writeText(other.absolutePath)
+        val blocked = File(filesDir, SafSyncEngine.UPLOADS_IN_FLIGHT_FILE + SafSyncEngine.PARTIAL_SUFFIX)
+        val failed = mutableListOf<File>()
+        engine.onWriteBackFailed = { failed.add(it) }
+        val device = ByteArrayOutputStream()
+        every { resolver.openOutputStream(any(), "wt") } answers {
+            assertTrue(blocked.mkdir())
+            File(blocked, "occupied").writeText("keep")
+            device
+        }
+
+        deliver(FileObserver.MODIFY, local.name)
+
+        assertEquals("the whole edit", device.toString(Charsets.UTF_8.name()))
+        assertTrue(failed.isEmpty())
+        assertEquals(listOf(other.absolutePath, local.absolutePath), journal.readLines())
+
+        assertTrue(blocked.deleteRecursively())
+        every { resolver.openOutputStream(any(), "wt") } returns ByteArrayOutputStream()
+        deliver(FileObserver.MODIFY, local.name)
+        assertEquals(listOf(other.absolutePath), journal.readLines())
+        assertTrue(failed.isEmpty())
     }
 
     @Test
@@ -370,19 +568,26 @@ class SafUploadInterruptionTest {
             "setup failed: the first write never reached the provider",
         )
 
-        // The second: a different engine over the same journal, which is what a
-        // recreated Activity builds, writing the same file and finishing at once.
-        val second = SafSyncEngine(context)
-        second.handleMirrorEvent(FileObserver.MODIFY, file, mirror, treeUri)
-        second.runWriteBackLoop { false }
+        try {
+            // A different document permits both writers to hold this mirror path.
+            val otherDocument = mockk<Uri>(relaxed = true)
+            every { otherDocument.toString() } returns "content://test/other/notes.txt"
+            val second = SafSyncEngine(context)
+            // Exercise the writer independently of the event's per-mirror admission.
+            SafSyncEngine::class.java.getDeclaredMethod(
+                "writeLocalToSaf", File::class.java, Uri::class.java,
+            ).apply { isAccessible = true }.invoke(second, file, otherDocument)
 
-        assertEquals(
-            listOf(file.absolutePath), engine.uploadsInFlight().toList(),
-            "the writer that landed first cleared the record the other one is inside",
-        )
-
-        released.set(true)
-        drain.join(5_000)
+            assertEquals(2, opens, "both document writes must reach the provider")
+            assertEquals(
+                listOf(file.absolutePath), engine.uploadsInFlight().toList(),
+                "the writer that landed first cleared the record the other one is inside",
+            )
+        } finally {
+            released.set(true)
+            drain.join(5_000)
+        }
+        assertFalse(drain.isAlive)
         assertFalse(journal.isFile, "the record outlived the last writer")
     }
 
