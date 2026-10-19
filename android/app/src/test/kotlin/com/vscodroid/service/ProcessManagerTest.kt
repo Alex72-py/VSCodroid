@@ -418,10 +418,12 @@ class ProcessManagerTest {
     private fun recordEditorServer(pid: Int, port: Int) {
         manager.portField = port
         File(tempDir, "server").mkdirs()
-        File(tempDir, "server/editor-server.pid").writeText("""{"pid":$pid,"port":$port}""")
+        File(tempDir, "server/editor-server.pid").writeText("""{"pid":$pid,"port":$port,"runId":"stop-fixture"}""")
+        field("serverRunId").set(manager, "stop-fixture")
         File(tempDir, "proc/$pid").mkdirs()
         File(tempDir, "proc/$pid/cmdline")
             .writeText("/lib/libnode.so\u0000/data/server/vscode-reh/out/server-main.js\u0000")
+        File(tempDir, "proc/$pid/environ").writeText("VSCODROID_SERVER_RUN_ID=stop-fixture\u0000")
         manager.procDirField = File(tempDir, "proc")
     }
 

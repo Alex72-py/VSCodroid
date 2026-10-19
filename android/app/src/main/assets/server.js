@@ -913,9 +913,10 @@ if (!fs.existsSync(rehEntryPoint)) {
     // The port is written with the pid on purpose: a stale file from an
     // earlier run on a different port must not vouch for this one.
     const pidFile = path.join(SERVER_DIR, 'editor-server.pid');
+    const pidNote = JSON.stringify({ pid: server.pid, port: PORT, runId: process.env.VSCODROID_SERVER_RUN_ID });
     try {
         const tmp = pidFile + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify({ pid: server.pid, port: PORT }));
+        fs.writeFileSync(tmp, pidNote);
         fs.renameSync(tmp, pidFile);
     } catch (e) {
         // Not fatal: adoption is an optimisation, and its absence costs a
@@ -925,7 +926,7 @@ if (!fs.existsSync(rehEntryPoint)) {
 
     const clearPidFile = () => {
         try {
-            fs.unlinkSync(pidFile);
+            if (fs.readFileSync(pidFile, 'utf8') === pidNote) fs.unlinkSync(pidFile);
         } catch {
             // Already gone, or never written. Either way there is nothing to
             // clean up, and a stale file is handled by the reader anyway.

@@ -2459,12 +2459,9 @@ runpy._run_module_as_main("pip")' "${'$'}__pip_errors" "${'$'}@" || __pip_status
 }
 pip3() { pip "${'$'}@"; }
 
-# A short note on the cause when an install fails for the reason this device
-# cannot fix.
-# There is no compiler here and none can run: SELinux refuses execve on anything
-# under filesDir, which is where a build would put its tools, so `pip install`
-# of a package with a compiled part walks to cmake and dies on EACCES with an
-# error that names cmake and not the device.
+# A short note when pip reports a failed build. The optional C/C++ toolchain
+# supports native builds, but packages may still need Android-compatible build
+# tools, dependencies or a prebuilt wheel. Pip's own error remains the diagnosis.
 #
 # The exit status cannot say which failure it was: pip returns 1 for a typo, a
 # network drop and a failed build alike. The records pip() kept can, so the note
@@ -2525,9 +2522,9 @@ __vscodroid_pip_explain() {
     [ -n "${'$'}{__VSCODROID_PIP_NOTED-}" ] && return 0
     grep -qE 'Failed building |metadata.generation.failed| when getting requirements to build' "${'$'}__errors" 2>/dev/null || return 0
     __VSCODROID_PIP_NOTED=1
-    echo "vscodroid: a package failed to build. If it has a part written in C, it cannot" >&2
-    echo "vscodroid: be built here: this device has no C compiler and cannot run one." >&2
-    echo "vscodroid: Pure Python packages install." >&2
+    echo "vscodroid: a package failed to build. Native builds may need the optional C/C++ toolchain" >&2
+    echo "vscodroid: and Android-compatible dependencies, or a compatible prebuilt wheel." >&2
+    echo "vscodroid: Check pip's error output for the cause." >&2
     echo "vscodroid: https://rmyndharis.github.io/VSCodroid/guide.html#python-packages-written-in-c" >&2
 }
 """
@@ -2536,9 +2533,10 @@ __vscodroid_pip_explain() {
      * Points pip at the wheels this project mirrors, and at nothing else.
      *
      * The device's interpreter accepts `cp314-cp314-android_24_arm64_v8a` and
-     * PyPI publishes almost nothing for it, so `pip install pandas` falls back
-     * to the sdist and dies at cmake: there is no compiler here and SELinux
-     * refuses to execve one from filesDir. The wheels exist, prebuilt, and
+     * PyPI publishes almost nothing for it, so `pip install pandas` can fall back
+     * to an sdist that requires additional native tools and dependencies. The
+     * optional C/C++ toolchain does not supply every package's build environment.
+     * The wheels exist, prebuilt, and
      * `wheelhouse.json` names the ones we mirror; this is the line that makes
      * pip look at them.
      *
@@ -2615,7 +2613,7 @@ __vscodroid_pip_explain() {
      * launch after an app update, with no re-extraction and nothing moving in
      * the storage pre-flight.
      */
-    private val pipBlockMarker = "__vscodroid_pip_explain()"
+    private val pipBlockMarker = "Native builds may need the optional C/C++ toolchain"
 
     /** The comment every pip block this app has written opens with, v1.3.0's included. */
     private val PIP_BLOCK_HEADER = "# pip/pip3: shell functions."
@@ -3483,8 +3481,12 @@ claude() {
 
         val present = extensionsDir.list()?.toList() ?: emptyList()
         val superseded = supersededExtensionDirs(present, bundled.toList())
+        val elsewhere = otherProfilesExtensionDirs()
+        var removedSuperseded = 0
         for (name in superseded) {
+            if (elsewhere == null || name in elsewhere) continue
             if (removeExtensionDir(File(extensionsDir, name))) {
+                removedSuperseded++
                 Logger.i(tag, "Removed superseded bundled extension: $name")
             }
         }
@@ -3531,8 +3533,9 @@ claude() {
         // The disk is read again here, after every sweep above, because the rule
         // asks whether the user's copy is on disk NOW; and nothing is removed
         // unless every profile's manifest could be read.
-        val listed = manifestEntryDirs(manifestFile)
-        val elsewhere = otherProfilesExtensionDirs()
+        // Superseded default entries will be replaced even when another profile
+        // needs the old directory, so they cannot make the new copy an orphan.
+        val listed = manifestEntryDirs(manifestFile)?.filterNot { it.second in superseded }
         if (listed != null && elsewhere != null) {
             val onDisk = extensionsDir.list()?.toList() ?: emptyList()
             for (name in orphanedBundledCopies(onDisk, bundled.toList(), listed, elsewhere)) {
@@ -3564,13 +3567,13 @@ claude() {
             // every bundled extension as new.
             rememberBundledIds(bundledIds)
         } else {
-            reconcileExtensionsManifest(manifestFile, extensionsDir, bundled, bundledIds)
+            reconcileExtensionsManifest(manifestFile, extensionsDir, bundled, bundledIds, superseded)
         }
 
         // Reports the decision. Reaching this line now also means every one of
         // those unpacks succeeded, since the loop above throws otherwise.
         Logger.i(tag, "Bundled extensions: ${toExtract.size} of ${bundled.size} needed unpacking, " +
-            "${superseded.size} superseded removed")
+            "$removedSuperseded superseded removed")
     }
 
     /**
@@ -3590,7 +3593,7 @@ claude() {
      *
      * The directory is read the way [reconcileExtensionsManifest] reads it; an
      * entry that names none carries "". Null for a missing or unparseable file,
-     * because the one caller deletes on the strength of what this lists.
+     * because callers delete on the strength of what this lists.
      */
     private fun manifestEntryDirs(manifestFile: File): List<Pair<String, String>>? {
         if (!manifestFile.isFile) return null
@@ -3622,13 +3625,15 @@ claude() {
      */
     private fun otherProfilesExtensionDirs(): Set<String>? {
         val profilesDir = File(Environment.getUserDataDir(context), "data/User/profiles")
-        if (!profilesDir.exists()) return emptySet()
+        if (Files.notExists(profilesDir.toPath())) return emptySet()
         val profiles = profilesDir.listFiles() ?: return null
         val dirs = mutableSetOf<String>()
         for (profile in profiles) {
             val manifest = File(profile, "extensions.json")
-            if (!manifest.exists()) continue
-            dirs += (manifestEntryDirs(manifest) ?: return null).map { it.second }
+            if (Files.notExists(manifest.toPath())) continue
+            val entries = manifestEntryDirs(manifest) ?: return null
+            if (entries.any { it.second.isEmpty() }) return null
+            dirs += entries.map { it.second }
         }
         return dirs
     }
@@ -3777,8 +3782,9 @@ claude() {
     /**
      * Brings the manifest back in line with the directories after an upgrade
      * swapped bundled extension versions underneath it. Conservative on
-     * purpose: an entry survives unless its directory is verifiably gone, and a
-     * bundled directory is only added to replace an entry that was just
+     * purpose: an entry survives unless its directory is verifiably gone or a
+     * bundled upgrade supersedes it. An older directory may still be needed by
+     * another profile. A bundled directory is only added to replace an entry just
      * dropped, never for an identifier with no entry at all, which is an
      * extension the user uninstalled, nor over a surviving entry, so a user's
      * own newer install keeps winning over the bundled copy.
@@ -3788,6 +3794,7 @@ claude() {
         extensionsDir: File,
         bundledDirs: Array<String>,
         bundledIds: List<String>,
+        supersededDirs: List<String>,
     ) {
         try {
             val entries = JSONArray(manifestFile.readText())
@@ -3801,7 +3808,9 @@ claude() {
                 val path = entry.optJSONObject("location")?.optString("path").orEmpty()
                 val dirName = entry.optString("relativeLocation")
                     .ifEmpty { if (path.isEmpty()) "" else File(path).name }
-                if (dirName.isNotEmpty() && !File(extensionsDir, dirName).exists()) {
+                if (dirName in supersededDirs ||
+                    (dirName.isNotEmpty() && !File(extensionsDir, dirName).exists())
+                ) {
                     dropped++
                     entry.optJSONObject("identifier")?.optString("id")?.let { droppedIds.add(it) }
                     continue

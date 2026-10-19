@@ -66,6 +66,7 @@ class ProcessManager(private val context: Context) {
      */
     @Volatile
     private var serverProcess: Process? = null
+    private var serverRunId: String? = null
     @Volatile
     private var watchdogThread: Thread? = null
 
@@ -923,6 +924,7 @@ class ProcessManager(private val context: Context) {
         val nodePath = Environment.getNodePath(context)
         val serverScript = Environment.getServerScript(context)
         val env = Environment.buildProcessEnvironment(context, _port)
+        val runId = UUID.randomUUID().toString()
 
         // These arguments reach server.js, not the editor server it forks. server.js
         // reads host, port and log as defaults and forwards exactly four keys --
@@ -950,6 +952,7 @@ class ProcessManager(private val context: Context) {
         return try {
             val processBuilder = ProcessBuilder(command).apply {
                 environment().putAll(env)
+                environment()["VSCODROID_SERVER_RUN_ID"] = runId
                 redirectErrorStream(true)
                 directory(context.filesDir)
             }
@@ -967,22 +970,19 @@ class ProcessManager(private val context: Context) {
             //
             // Read after the spawn rather than before it, because before it the
             // answer is meaningless: the window this closes opens at the spawn.
-            if (isShuttingDown) {
-                Logger.i(tag, "A stop landed while the server was spawning; ending it again")
-                spawned.destroyForcibly()
-                return false
+            synchronized(readinessLock) {
+                if (isShuttingDown) {
+                    Logger.i(tag, "A stop landed while the server was spawning; ending it again")
+                    spawned.destroyForcibly()
+                    return false
+                }
+                serverRunId = runId
+                serverProcess = spawned
+                // Publish the owner and its readers together so Stop captures one run.
+                listenUnreported = true
+                startOutputReader()
+                startWatchdog()
             }
-            serverProcess = spawned
-            // After the process is the current one and before its reader exists,
-            // which is the only order that works: the reader clears this on the
-            // listening line, and only for the process that is current, so a
-            // reader still draining the previous process's pipe finds a different
-            // process here and leaves the flag alone. No probe can slip in ahead
-            // of it, because every probe with this start's epoch begins after
-            // this call returns. See [listenUnreported].
-            listenUnreported = true
-            startOutputReader()
-            startWatchdog()
             // The source is named, not only the number. A ceiling in a bug report
             // that could be either a derived value or a user's is a number nobody
             // can act on.
@@ -1187,14 +1187,19 @@ class ProcessManager(private val context: Context) {
      *  - **The note is consumed either way**, so a pid this declines to kill is not
      *    reconsidered on the next call.
      *
+     * A captured note also requires the same run identity in the process environment;
+     * a replaced note or unreadable identity is left untouched.
+     *
      * @return whether a process was signalled. False covers no note, a note for another
      *   port, a pid already gone, and a pid that is no longer an editor server.
      */
-    internal fun reapRecordedEditorServer(reason: String): Boolean {
+    internal fun reapRecordedEditorServer(reason: String, capturedNote: String? = null): Boolean {
         val note = File(Environment.getServerDir(context), EDITOR_PID_FILE)
         val recorded = try {
             if (!note.isFile) return false
-            JSONObject(note.readText())
+            val contents = note.readText()
+            if (capturedNote != null && contents != capturedNote) return false
+            JSONObject(contents)
         } catch (e: Exception) {
             Logger.w(tag, "Could not read the editor server note: ${e.message}")
             return false
@@ -1202,6 +1207,18 @@ class ProcessManager(private val context: Context) {
         val pid = recorded.optInt("pid", 0)
         val port = recorded.optInt("port", 0)
         if (pid <= 0 || port != _port) return false
+        if (capturedNote != null) {
+            val owner = recorded.optString("runId", "")
+            val environment = try {
+                File(File(procDir, pid.toString()), "environ").readText()
+            } catch (_: Exception) {
+                Logger.w(tag, "Could not verify editor server $pid ownership; leaving it alone ($reason)")
+                return false
+            }
+            if (owner.isEmpty() || "VSCODROID_SERVER_RUN_ID=$owner" !in environment.split('\u0000')) {
+                return false
+            }
+        }
 
         // Deliberately the last thing before the signal. Re-reading here rather than
         // trusting the check adoption already made is the whole mitigation: that one may
@@ -1212,6 +1229,7 @@ class ProcessManager(private val context: Context) {
         } catch (e: Exception) {
             null
         }
+        if (capturedNote != null && runCatching { note.readText() }.getOrNull() != capturedNote) return false
         note.delete()
         if (cmdline == null) {
             Logger.i(tag, "Editor server $pid is already gone; nothing to reap ($reason)")
@@ -1504,11 +1522,15 @@ class ProcessManager(private val context: Context) {
      * handler forwards it to the child and SIGKILLs that child
      * CHILD_KILL_AFTER_SIGTERM_MS later, well inside the budget here, so an
      * ordinary stop has already ended the editor server before the wait returns.
-     * What reaches the reap is a bootstrap that never ran that handler at all.
+     * A bootstrap already dead before Stop also needs the backstop: its wait can
+     * succeed while its editor child is still alive.
      */
     fun stopServer() {
-        isShuttingDown = true
-        clearReadiness()
+        val (stoppingProcess, stoppingRunId, stoppingWatchdog) = synchronized(readinessLock) {
+            isShuttingDown = true
+            clearReadiness()
+            Triple(serverProcess, serverRunId, watchdogThread)
+        }
         // Nothing of ours is running with the user's number after this, so a crash
         // report still on its way to the service must not be charged against it.
         heapOverrideActive = false
@@ -1542,11 +1564,16 @@ class ProcessManager(private val context: Context) {
             adopted = false
         }
         Logger.i(tag, "Stopping server...")
-        serverProcess?.let { process ->
-            // Whether the bootstrap went on its own, which is the only case where
-            // the editor server it forked has certainly gone too: `server.js` exits
-            // from the child's exit handler, so a bootstrap that exited was told by
-            // that child, and the note naming it was deleted in the same handler.
+        stoppingProcess?.let { process ->
+            // Capture ownership before signalling; a later note may name a replacement.
+            val capturedNote = try {
+                File(Environment.getServerDir(context), EDITOR_PID_FILE).readText().takeIf {
+                    stoppingRunId != null && JSONObject(it).optString("runId", "") == stoppingRunId
+                }
+            } catch (_: Exception) {
+                null
+            }
+            val wasAlive = process.isAlive
             var bootstrapExited = false
             try {
                 process.destroy()
@@ -1562,18 +1589,21 @@ class ProcessManager(private val context: Context) {
                 Logger.w(tag, "Shutdown failed, force killing", e)
                 process.destroyForcibly()
             }
-            // A bootstrap that had to be killed took nothing with it, and the
-            // recorded pid is the only handle this class has on what it left. Not
-            // run on the graceful path, and not merely because it would be a no-op
-            // there: a note found after a clean exit belongs to a server something
-            // else has started since, and this would end it.
-            if (!bootstrapExited) {
-                reapRecordedEditorServer("its bootstrap was killed before it exited")
+            // A wait on an already dead bootstrap says nothing about its child's exit.
+            if ((!wasAlive || !bootstrapExited) && capturedNote != null) {
+                if (!reapRecordedEditorServer("its bootstrap could not stop it", capturedNote)) {
+                    Logger.w(tag, "The recorded editor server could not be ended for this stop")
+                }
             }
         }
-        serverProcess = null
-        watchdogThread?.interrupt()
-        watchdogThread = null
+        synchronized(readinessLock) {
+            if (serverProcess === stoppingProcess && serverRunId == stoppingRunId) {
+                serverProcess = null
+                serverRunId = null
+            }
+            if (watchdogThread === stoppingWatchdog) watchdogThread = null
+        }
+        stoppingWatchdog?.interrupt()
     }
 
 

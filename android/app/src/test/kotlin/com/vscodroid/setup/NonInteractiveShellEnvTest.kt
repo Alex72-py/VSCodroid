@@ -337,6 +337,45 @@ class NonInteractiveShellEnvTest {
      * still count as an install.
      */
     @Test
+    fun `an existing interactive terminal receives updated native build guidance`() {
+        assumeTrue(File("/bin/bash").canExecute(), "no /bin/bash on this host to ask")
+        val setup = FirstRunSetup(context)
+        val npm = File(filesDir, "usr/lib/node_modules/npm/bin/npm-cli.js")
+        npm.parentFile.mkdirs()
+        npm.writeText("// npm")
+        val bashrc = File(filesDir, "home/.bashrc")
+        bashrc.parentFile.mkdirs()
+        bashrc.writeText("alias keep_me='printf preserved'\n")
+        setup.createNpmWrappers()
+        bashrc.writeText(bashrc.readText().replace(
+            "a package failed to build. Native builds may need the optional C/C++ toolchain",
+            "a package failed to build. If it has a part written in C, it cannot",
+        ).replace(
+            "and Android-compatible dependencies, or a compatible prebuilt wheel.",
+            "be built here: this device has no C compiler and cannot run one.",
+        ))
+        assertTrue(bashrc.readText().contains("cannot run one"))
+
+        setup.createNpmWrappers()
+        val repaired = bashrc.readBytes()
+        setup.createNpmWrappers()
+        assertTrue(repaired.contentEquals(bashrc.readBytes()), "each launch appended another pip block")
+        val script = failingPip + "ERRORS='Failed building wheel for sample'\npip install sample; echo status=\$?; keep_me"
+        val process = ProcessBuilder("/bin/bash", "--noprofile", "--rcfile", bashrc.path, "-ic", script)
+            .directory(filesDir)
+            .redirectErrorStream(true).apply {
+                environment().remove("BASH_ENV")
+                environment().put("HOME", bashrc.parent)
+            }.start()
+        val output = process.inputStream.bufferedReader().readText()
+        assertTrue(process.waitFor(30, TimeUnit.SECONDS), "interactive bash did not finish")
+        assertTrue(output.contains("C/C++ toolchain"), "the interactive shell kept old guidance: $output")
+        assertFalse(output.contains("cannot run one"), "the interactive shell kept the old restriction: $output")
+        assertTrue(output.contains("status=3"), "pip's exit status changed: $output")
+        assertTrue(output.contains("preserved"), "the update lost a user alias: $output")
+    }
+
+    @Test
     fun `a pip install that fails to build gets one note, once, and keeps its status`() {
         val bash = File("/bin/bash")
         assumeTrue(bash.canExecute(), "no /bin/bash on this host to ask")
@@ -373,6 +412,14 @@ class NonInteractiveShellEnvTest {
             "wrapping pip changed the exit status a script or a task sees: $out",
         )
         assertTrue(out.contains("leftover=[]"), "the errors file was left in TMPDIR: $out")
+        assertTrue(
+            out.any { it.contains("C/C++ toolchain") },
+            "the build note does not explain the available compiler toolchain: $out",
+        )
+        assertFalse(
+            out.any { it.contains("cannot run one") || it.contains("cannot be built here") },
+            "the build note rules out the supported C/C++ toolchain: $out",
+        )
 
         // What pip prints for a build, in every form the note answers, and the
         // failures that read like one and are not: a build dependency that does
