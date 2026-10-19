@@ -109,7 +109,7 @@ writes no results at all, and its exit code is indistinguishable from a genuine
 failure. It is also the only place the skip count appears, and a skipped test
 prints nothing in Gradle's console output.
 
-**At HEAD there are 93 tests across 15 classes.** That figure is not kept by
+**At HEAD there are 96 tests across 16 classes.** That figure is not kept by
 hand: `scripts/check-instrumented-inventory.py` counts the sources with
 `grep -cE '^\s*@Test'` and fails the build when this file disagrees with them,
 because it had said 22 and then 37 while the suite was neither, and a stale
@@ -127,6 +127,7 @@ XML rather than trusting this paragraph, which is what it is here to encourage.
 
 | File | Covers |
 |---|---|
+| `PipGuidanceOnDeviceTest` | Runs the generated interactive pip helpers and noninteractive `BASH_ENV` through the APK's `libbash.so` under the app uid. A substituted Python command produces pip error records without network access or package installation. Build failures retain stderr and exit status, receive accurate toolchain advice once per shell, and remove temporary records; missing packages receive no build advice and successful calls stay quiet. An older interactive helper is upgraded while preserving user content and avoiding repeated appends. This does not establish compatibility of third-party packages or wheels. |
 | `ProfileExtensionPreservationOnDeviceTest` | Runs bundled-extension extraction and manifest reconciliation with real APK assets in isolated app-private storage. Named profiles retain older extension bytes and manifests while the default profile advances, including absolute-path references and malformed or unreadable manifests. Unreferenced copies are removed, and removing a profile reference allows reclamation after reopening the setup context. No first-run setup or running editor is required; these cases do not establish workbench activation. |
 | `ServerHealthTest` | The server becomes reachable, answers its readiness probe, and survives activity recreation. None of this is reachable from a JVM test. |
 | `MainActivityTest` | WebView and ExtraKeyRow initial state; the About dialog's trademark disclaimer, which is a stated legal requirement rather than cosmetic. |
