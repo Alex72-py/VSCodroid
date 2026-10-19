@@ -4280,10 +4280,15 @@ class SafSyncEngine(private val context: Context) {
         val access = (job.mirrorRoot ?: session.root)?.let {
             outboundAccess(it, job.generation ?: session.generation)
         }
-        // Small debounce: skip if more recent job for same path exists. Scoped to the
-        // session the job came off, so it cannot see, or be blinded by, the jobs of a
-        // folder that is closing or one that has just opened.
-        if (session.queue.any { it.localPath == job.localPath && it.timestamp > job.timestamp }) {
+        // Small debounce: skip a job that a more recent one for the same path makes
+        // pointless, see [supersededByLaterJob]. Scoped to the session the job came off,
+        // so it cannot see, or be blinded by, the jobs of a folder that is closing or one
+        // that has just opened.
+        if (session.queue.any {
+                it.localPath == job.localPath && it.timestamp > job.timestamp &&
+                    supersededByLaterJob(job, it)
+            }
+        ) {
             return
         }
 
@@ -4324,18 +4329,16 @@ class SafSyncEngine(private val context: Context) {
                             announceLost(localFile)
                         }
                     }
-                } else if (job.safParentUri != null && job.safTreeUri != null) {
+                } else if (job.safTreeUri != null) {
                     // FileObserver may report MODIFY instead of CREATE for new files
                     // (e.g., `echo > file` on Android API 36). Fall through to CREATE.
                     Logger.d(tag, "MODIFY on unknown file, treating as CREATE: ${localFile.name}")
-                    createInSaf(localFile, job.safParentUri, job.safTreeUri, access)
+                    createInQueuedParent(job, localFile, access)
                 }
             }
             SyncType.CREATE -> {
                 val localFile = File(job.localPath)
-                if (localFile.exists() && job.safParentUri != null && job.safTreeUri != null) {
-                    createInSaf(localFile, job.safParentUri, job.safTreeUri, access)
-                }
+                if (localFile.exists()) createInQueuedParent(job, localFile, access)
             }
             SyncType.DELETE -> {
                 // A null uri is NOT the same outcome as a refusal, though it used to
@@ -4351,6 +4354,16 @@ class SafSyncEngine(private val context: Context) {
                 // positively answers "gone": a provider that cannot answer is still
                 // treated as holding, so a transient failure keeps the warning it used
                 // to give.
+                //
+                // A rename queued ahead of this job is the other way a document that was
+                // missing when the event arrived is there by now: after `mv a b && rm -r b`
+                // in one poll the rename runs first, and the children of `b` exist on the
+                // device under that name. That is reported too, and not looked up again by
+                // path and deleted. A deletion cannot be undone, and a lookup at the drain
+                // finds whatever sits at the path by then, which is no longer the document
+                // the event named. The Explorer's own folder delete already leaves the
+                // device copy for the same reason, and deleting the folder again after the
+                // next open resolves it at once.
                 val refused = when {
                     job.safDocUri == null ->
                         job.safTreeUri != null &&
@@ -4509,6 +4522,45 @@ class SafSyncEngine(private val context: Context) {
                 } == null) onWriteBackFailed(localFile)
             }
         }
+    }
+
+    /**
+     * Creates [localFile] in its folder on the device for a job whose event could not
+     * name that folder.
+     *
+     * The event resolved the folder when it arrived, and the job that makes or renames
+     * that folder was still ahead of it in the queue, so a folder the device holds by
+     * now was not there yet. Dropped on that, a save inside a folder renamed a moment
+     * earlier never reached it, and nothing said so.
+     *
+     * Asking again is not enough on its own, because dropping was also what kept a burst
+     * of files in a new folder (a clone, an install) from being sent twice: the folder's
+     * own create uploads whatever the mirror holds when it runs and remembers each
+     * document it makes, so a path already remembered was carried and has nothing left
+     * to do. A renamed folder's children are not remembered, [forgetCachedSubtree]
+     * dropped them and the rename does not refill them, so they go through. A folder
+     * that is still not on the device leaves the file in the mirror only, and the user
+     * is told, while the cache still speaks for the job's tree: a drain can outlive its
+     * folder, and then the file may well have been carried by its folder's create, so no
+     * notice is given for it. A link is never uploaded, so one queued here has nothing
+     * to report.
+     */
+    private fun createInQueuedParent(job: SyncJob, localFile: File, access: OutboundAccess?) {
+        val treeUri = job.safTreeUri ?: return
+        var parentUri = job.safParentUri
+        if (parentUri == null) {
+            // Built by something other than [handleMirrorEvent]: nothing to ask about.
+            if (job.relativePath.isEmpty()) return
+            if (treeUri != cacheTree) return
+            if (cachedDocId(treeUri, job.relativePath) != null) return
+            if (isLink(localFile)) return
+            parentUri = resolveDocumentUri(treeUri, File(job.relativePath).parent ?: "", access)
+            if (parentUri == null) {
+                announceLost(localFile)
+                return
+            }
+        }
+        createInSaf(localFile, parentUri, treeUri, access)
     }
 
     // -- FileObserver --
@@ -5450,6 +5502,30 @@ class SafSyncEngine(private val context: Context) {
             .filter { now - it.atMillis <= RENAME_PAIR_WINDOW_MS }
             .singleOrNull()
             ?.relativePath
+
+        /**
+         * Whether [later], queued after [job] for the same path, makes running [job]
+         * pointless.
+         *
+         * A save is made from the mirror as it is when it runs, so any later job for the
+         * path redoes it and the earlier one can go. A rename goes only for a later rename
+         * onto the same name: nothing else puts the move on the device, but two cannot
+         * both land, and the second would be asked to rename into a name the device holds
+         * by then, which providers answer with an invented one. A delete goes for a later
+         * write of the same kind and for no other. A file removed and written again is
+         * overwritten in place, and the save queued behind a checkout's unlink holds the
+         * document the delete would have removed, so the delete has to be the one that is
+         * dropped. A file replaced by a folder, or a folder by a file, is not the document
+         * the later write would find, and dropping the delete left the device with the
+         * old kind.
+         */
+        internal fun supersededByLaterJob(job: SyncJob, later: SyncJob): Boolean = when (job.type) {
+            SyncType.CREATE, SyncType.MODIFY -> true
+            SyncType.RENAME -> later.type == SyncType.RENAME
+            SyncType.DELETE -> later.type == SyncType.DELETE ||
+                ((later.type == SyncType.CREATE || later.type == SyncType.MODIFY) &&
+                    later.isDirectory == job.isDirectory)
+        }
 
         /** The directory part of a mirror-relative path; empty for a top-level entry. */
         internal fun parentPathOf(relativePath: String): String =
