@@ -109,7 +109,7 @@ writes no results at all, and its exit code is indistinguishable from a genuine
 failure. It is also the only place the skip count appears, and a skipped test
 prints nothing in Gradle's console output.
 
-**At HEAD there are 75 tests across thirteen classes.** That figure is not kept by
+**At HEAD there are 76 tests across fourteen classes.** That figure is not kept by
 hand: `scripts/check-instrumented-inventory.py` counts the sources with
 `grep -cE '^\s*@Test'` and fails the build when this file disagrees with them,
 because it had said 22 and then 37 while the suite was neither, and a stale
@@ -128,6 +128,7 @@ XML rather than trusting this paragraph, which is what it is here to encourage.
 | File | Covers |
 |---|---|
 | `ServerHealthTest` | The server becomes reachable, answers its readiness probe, and survives activity recreation. None of this is reachable from a JVM test. |
+| `EditorShutdownOnDeviceTest` | Extracts an isolated copy of the packaged server and tools, starts the real native bootstrap without service retries, and verifies from the app's SELinux domain that Stop ends an editor surviving its bootstrap. Checks the real PID environment and socket, repeated Stop, a fresh run identity and cooperative shutdown. Saves phase metadata and screenshots in a separate cache directory; it changes no existing workspace or setup preferences and has no skip path. |
 | `MainActivityTest` | WebView and ExtraKeyRow initial state; the About dialog's trademark disclaimer, which is a stated legal requirement rather than cosmetic. |
 | `SplashActivityTest` | First-run extraction, and that a later launch skips it. The slow ones. |
 | `FileObserverTreeSemanticsTest` | The platform behaviour the SAF write-back rests on: that a watch covers a directory and not a tree, that the path an event reports is the bare entry name, and that inotify's directory flag survives the trip through FileObserver. Needs no app state at all, so it has no precondition that a skip could hide. |

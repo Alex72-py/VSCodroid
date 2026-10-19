@@ -434,6 +434,7 @@ async function stoppingTakesTheEditorServerWithIt() {
         '// Traps the signal and keeps running, which is the case that produced',
         '// the orphan: a loaded device, many extensions, a pty host mid-write.',
         "process.on('SIGTERM', () => {});",
+        "fs.writeFileSync(path.join(__dirname, 'child-run-id'), process.env.VSCODROID_SERVER_RUN_ID || '');",
         'setInterval(() => {}, 1000);',
         '// Announced only once the handler is installed. The pid note is written',
         '// by the bootstrap at fork time, so waiting on that alone signals a',
@@ -463,12 +464,20 @@ async function stoppingTakesTheEditorServerWithIt() {
     const trapping = path.join(dir, 'vscode-reh', 'out', 'trapping');
     const bootstrap = spawn(process.execPath, [path.join(dir, 'server.js'), '--host=127.0.0.1'], {
         stdio: 'ignore',
+        env: { ...process.env, VSCODROID_SERVER_RUN_ID: 'shutdown-fixture' },
     });
     let childPid = 0;
     try {
         await until(() => fs.existsSync(pidFile), 'the bootstrap to record the editor server pid');
-        childPid = JSON.parse(fs.readFileSync(pidFile, 'utf8')).pid;
+        const recorded = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
+        childPid = recorded.pid;
+        assert.strictEqual(recorded.runId, 'shutdown-fixture', 'the PID note must identify its bootstrap run');
         await until(() => fs.existsSync(trapping), 'the editor server to install its SIGTERM trap');
+        assert.strictEqual(
+            fs.readFileSync(path.join(dir, 'vscode-reh', 'out', 'child-run-id'), 'utf8'),
+            'shutdown-fixture',
+            'the editor child must inherit the same run identity as its PID note',
+        );
 
         bootstrap.kill('SIGTERM');
         await until(
@@ -477,6 +486,30 @@ async function stoppingTakesTheEditorServerWithIt() {
             5_000,
         );
         await until(() => !alive(bootstrap.pid), 'the bootstrap to exit once its child had gone');
+    } finally {
+        if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ } }
+        bootstrap.kill('SIGKILL');
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+async function exitingBootstrapPreservesReplacementNote() {
+    const dir = fixture(UPSTREAM, { serverMain: 'setInterval(() => {}, 1000);\n' });
+    const pidFile = path.join(dir, 'editor-server.pid');
+    const bootstrap = spawn(process.execPath, [path.join(dir, 'server.js'), '--host=127.0.0.1'], {
+        stdio: 'ignore',
+        env: { ...process.env, VSCODROID_SERVER_RUN_ID: 'previous-run' },
+    });
+    let childPid = 0;
+    try {
+        await until(() => fs.existsSync(pidFile), 'the previous PID note');
+        childPid = JSON.parse(fs.readFileSync(pidFile, 'utf8')).pid;
+        const replacement = JSON.stringify({ pid: 1, port: 13400, runId: 'replacement' });
+        fs.writeFileSync(pidFile, replacement);
+        bootstrap.kill('SIGTERM');
+        await until(() => !alive(bootstrap.pid), 'the previous bootstrap to exit');
+        assert.ok(fs.existsSync(pidFile), 'the previous bootstrap removed the replacement note');
+        assert.strictEqual(fs.readFileSync(pidFile, 'utf8'), replacement);
     } finally {
         if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ } }
         bootstrap.kill('SIGKILL');
@@ -1537,6 +1570,7 @@ async function stoppingTakesTheEditorServerWithIt() {
 
 preloadRidesAsOneToken()
     .then(proxySurvivesTheBootstrap)
+    .then(exitingBootstrapPreservesReplacementNote)
     .then(stoppingTakesTheEditorServerWithIt)
     .then(() => {
         console.log(
