@@ -426,11 +426,14 @@ __vscodroid_pip_note() {
         bundleNpm()
         FirstRunSetup(context).createNpmWrappers()
         // What a later release sees: this block, under a marker it no longer uses.
-        bashrc.writeText(bashrc.readText().replace("__vscodroid_pip_explain()", "__vscodroid_pip_explain_v1()"))
+        bashrc.writeText(bashrc.readText().replace(
+            "Native builds may need the optional C/C++ toolchain", "Native build guidance v1",
+        ))
 
         FirstRunSetup(context).createNpmWrappers()
 
-        assertTrue(bashrc.readText().contains("__vscodroid_pip_explain()"), "the app's own block froze the next one out")
+        assertTrue(bashrc.readText().contains("Native builds may need the optional C/C++ toolchain"),
+            "the app's own block froze the next one out")
     }
 
     /**

@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Stopping the editor also ends its surviving server when the bootstrap has already exited.
+- Python package build failures explain the optional C/C++ toolchain and Android dependency requirements.
+- App updates preserve older bundled extension versions still used by named profiles while updating the default profile.
+- Device-folder cleanup retains unrecorded workspace files, including names ending in `.vscodroid-partial`.
+
+- Device-folder imports preserve local edits made while the provider is being read.
+- Device-folder directory deletes preserve descendants added or changed on the device since the folder was opened.
+- Device-folder saves preserve both copies and report a failure when the upload recovery record cannot be written.
 - Device-folder sync preserves local edits when a conflicting device copy cannot be kept and protects documents in directories the provider could not list.
 - Reopening a device folder rejects stale saves, deletes and watcher callbacks from the previous sync.
 - Reopening a device folder reclaims abandoned temporary downloads while retaining active copies and existing workspace files.
