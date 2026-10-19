@@ -85,7 +85,7 @@ is why `listSshKeys` no longer answers with a key's comment and why a forced
    (`SecurityManager.generateToken`, in `bridge/`, not a `security/` package).
    `MainActivity.injectBridgeToken()` writes it to `window.__vscodroid.authToken`
    after the page loads.
-2. **Every method, not a chosen subset**: all 34 `@JavascriptInterface` methods take the
+2. **Every method, not a chosen subset**: all 35 `@JavascriptInterface` methods take the
    token and validate it before doing anything, returning without acting on refusal
    (§2.4 records the six whose refusal value is not an empty one).
    `BridgeTokenUniformityTest` enumerates them by reflection and fails the build
@@ -95,8 +95,8 @@ is why `listSshKeys` no longer answers with a key's comment and why a forced
    refused and verifies the method *consulted* `validateToken`. It deliberately does not
    check the signature, because a `String` first parameter proves nothing about whether the
    method reads it.
-   **The token is not always the first parameter.** Four methods take it last --
-   `openExternalUrl(url, authToken)`, `installToolchain(name, authToken)`,
+   **The token is not always the first parameter.** Five methods take it last:
+   `registerAuthCallback(requestId, nonce, documentId, pageGeneration, authToken)`, `openExternalUrl(url, authToken)`, `installToolchain(name, authToken)`,
    `removeToolchain(name, authToken)` and `cancelToolchainInstall(name, authToken)`.
    Read the signature before calling; the position is not a convention you can rely on.
 3. **No URL filtering beyond one address.** `openExternalUrl()` refuses this app's
@@ -191,8 +191,8 @@ The OAuth pair described a flow this app does not implement; see §2.5.
 Exposed via `@JavascriptInterface`:
 
 Every method takes the session token and validates it before doing anything; a call
-with a token that does not match is refused before the method acts. Twenty-eight of
-the thirty-four then return an empty value: `false`, `null`, `""`, `"{}"`, `"[]"`,
+with a token that does not match is refused before the method acts. Twenty-nine of
+the thirty-five then return an empty value: `false`, `null`, `""`, `"{}"`, `"[]"`,
 `0`, or nothing. **Six do not, and each is truthy on refusal.**
 `generateSshKey` returns `{"success":false,"error":"unauthorized"}`, so a caller
 testing `if (!result)` reads a refusal as success; test its `success` field.
@@ -200,7 +200,7 @@ testing `if (!result)` reads a refusal as success; test its `success` field.
 `listSafMirrors` return the refusal sentence itself,
 because for those five the EMPTY string is the success value, so the polarity is
 reversed and a truthiness test reads backwards in the other direction. Empty is not falsy
-for five of the twenty-eight either: `getDeviceInfo` refuses with `"{}"`, and
+for five of the twenty-nine either: `getDeviceInfo` refuses with `"{}"`, and
 `getRecentFolders`, `listSshKeys`, `getAvailableToolchains` and `getInstalledToolchains`
 with `"[]"`, and both are non-empty strings, so truthy until parsed. Read the token from
 `window.__vscodroid.authToken`, which MainActivity sets once the bridge is installed.
@@ -208,7 +208,7 @@ with `"[]"`, and both are non-empty strings, so truthy until parsed. Read the to
 added without the check, so this holds for the class rather than for the list below.
 
 **Registered is not the same as reachable, and the difference decides what an extension
-can do.** All 34 methods below live on the `AndroidBridge` object injected into the
+can do.** All 35 methods below live on the `AndroidBridge` object injected into the
 workbench page, so anything running in that page's own realm can call them directly. An
 extension cannot: it runs in the web extension host, which does not see objects added by
 `addJavascriptInterface`. Extensions reach the bridge over the BroadcastChannel relay
@@ -297,6 +297,12 @@ fun hasClipboardText(authToken: String): Boolean
 #### Navigation
 
 ```kotlin
+@JavascriptInterface
+fun registerAuthCallback(requestId: String, nonce: String, documentId: String, pageGeneration: Long, authToken: String): Boolean
+// Registers the request and immutable document identity minted by the callback provider.
+// Returns false for a stale generation, invalid identity, conflicting nonce or full record.
+// Called directly by the workbench; unavailable through the extension command relay.
+
 @JavascriptInterface
 fun openExternalUrl(url: String, authToken: String): String  // note: token LAST
 // Hands the URL to a browser: a Chrome Custom Tab for https to any host but
@@ -617,80 +623,19 @@ reads two things out of it: the request `id` (`callbackRequestId`) and the
 between this app and the browser and is not the extension's. No provider, code or
 state is parsed on the Kotlin side.
 
-**Six gates, and all of them refuse rather than relay.** The VIEW filter is
-exported and `BROWSABLE`, so any app or web page on the device can fire this
-intent:
+The exported `BROWSABLE` intent filter can be invoked by any app or web page. The relay accepts only the exact callback scheme and host, limits the JSON payload to 8192 characters, requires a loaded workbench, and matches an active issued request id and its nonce before checking the ten-minute launch window. Invalid returns are logged without payloads. A genuine expired return shows the existing timeout notice once and retires that activation without releasing its identity.
 
-| Gate | Where | What it rejects |
-|---|---|---|
-| `isExtensionCallback(scheme, host)` | `MainActivity.kt` | Anything that is not exactly scheme `vscodroid` **and** host `callback` |
-| `MAX_CALLBACK_PAYLOAD_CHARS` | `MainActivity.receiveCallbackIntent` | A `data` parameter longer than 8192 characters, refused before anything parses it: the platform's JSON reader recurses once per nesting level with no depth cap, and the stack overflow a deep enough payload causes would take the process with it. Logged only |
-| `workbenchLoaded` | `MainActivity.receiveCallbackIntent` | A callback arriving with no workbench page to receive it. Shows a "sign in again" toast, at most once per Activity instance, rather than injecting, deliberately ahead of the timing gate, because a process killed while the browser had the foreground has no record of opening a tab |
-| `AuthTabWindow.armedAt(callbackRequestId(data))` | `MainActivity.kt` | A callback whose payload cannot be parsed, or whose `vscode-reqid` this app never launched a browser for. Logged only; a message here would be one an outside caller could raise at will |
-| `callbackSecretMatches(callbackNonce(data), AuthTabWindow.nonceFor(id))` | `MainActivity.kt` | A callback that does not carry back the `vscodroid-nonce` the launched address carried (patch 0019 mints it beside `vscode-reqid`). Logged only, and ahead of the timing gate, so a forged callback can neither raise its message nor spend the record. Enforced only where the launch carried one: a launch that carried none accepts whatever the callback carries |
-| `authCallbackIsExpected(armedAt, now, AUTH_TAB_WINDOW_MILLIS)` | `MainActivity.kt` | A callback for a request this app did launch, arriving more than `AUTH_TAB_WINDOW_MILLIS` (10 minutes, `AndroidBridge.kt`) after that launch. Shows a fixed "sign-in took too long" toast, since a slow consent screen or second factor otherwise fails in silence, and takes the launch record back as it does so |
+Patch 0019 registers each real callback id and minted nonce through `registerAuthCallback` before returning its URI. The native registry accepts canonical positive ids, exactly 32 lowercase hexadecimal nonce and document-id characters, the current document generation and a valid bridge token. Repeating the same registration is harmless; a conflicting nonce or document identity is refused. The method is not exposed through the extension command relay.
 
-`armedAt` and the window together test whether *this app* went looking for
-**this** sign-in, and on their own they cannot tell a genuine return from an
-invented one. The legitimate sender is a browser, so there is no caller identity
-to check, and the callback id is a counter the workbench hands out from one rather
-than a secret. The nonce is the secret: it left the device inside the address this
-app opened, and nothing on the device serves it back. Where a launch carried none,
-the id and the window are still all there is.
+Requests created before token injection remain in a private provider queue. Native token injection sets the document generation and dispatches `vscodroid-bridge-ready`; the provider synchronously flushes its own queued identities. Native readiness is accepted only after the JavaScript completion marker confirms that generation and successful registration. The source document must be the owned top-level HTTP workbench at the configured loopback port and root path. Completion from a replaced WebView or document is ignored.
 
-That makes the last gate a bound on the message rather than a wall in front of
-it. Records are deliberately kept past their own window, and the id is a small
-integer, so an outside caller naming a request the user really did start, one
-whose launch carried no nonce, reaches that toast once. Taking the record back as the message goes up means every
-further arrival for that id falls through to the gate above it, which says
-nothing. An accepted callback does **not** consume its record: the workbench
-collects the relayed value asynchronously, and the resume path asks this same
-record whether to leave the page alone.
+A main-frame auth navigation before readiness waits in a queue of at most 32 URLs with one fixed 30-second deadline. Successful bootstrap drains only matching registered requests. Failed bootstrap, timeout, page failure or replacement clears the queue without opening a browser. Subframes cannot enqueue auth launches. Ordinary external links keep their existing behavior.
 
-A launch carrying no readable request id arms nothing, so its callback is refused
-by the gate above and nothing is shown. `openExternalUrl` still reports the launch
-as made, so a provider that echoes the callback address back in a form
-`authRequestIdsIn` cannot read fails quietly rather than loudly.
+Outgoing addresses can activate only an already issued id with its original nonce. Missing, alternate or unissued pairs grant no callback authority. The parser reads at most eight distinct ids and applies the one extracted nonce independently to each issued identity. A repeated active launch preserves its original timestamp. Failed browser attempts retain the issued identity for an original-nonce retry; overlapping failures cannot remove an activation another attempt successfully launched.
 
-What a launch arms is the set of request ids the outgoing address carries, not
-the fact that a browser opened. `callback.html` refuses to run without a
-`vscode-reqid` and relays that same parameter on as the id, so a callback can only
-exist for a request whose id left this app inside the address it opened;
-`authRequestIdsIn` reads them out, under one or two rounds of percent-encoding,
-because the callback address usually travels as a parameter of the authorisation
-address. A documentation link carries none and arms nothing.
+The registry retains at most 32 issued identities per document and refuses additional registrations without evicting existing requests. Arbitrary outgoing ids consume no capacity. Reload, folder switch, renderer recreation and process recreation discard the old authority. Numeric ids may then repeat with fresh nonces. A valid accepted callback keeps its launch visible while the workbench collects the relayed value, preserving resume suppression. The relay removes only the nonce parameter and preserves all other callback query bytes.
 
-At most the first eight of them, and that bound is on the record rather than on
-the address. The record keeps the most recent 32 launches and drops the eldest to
-stay there, so without a cap a single address naming 32 ids evicted the sign-in
-the user had open in the browser at that moment, whose callback then arrived for
-an id nothing had recorded and was dropped in the log with nothing said. Eight
-because every real authorisation address names exactly one. It bounds what one
-launch can do and not what many can: enough separate launches still fill the
-record.
-
-Neither message carries any part of the callback. The payload arrives through an
-exported filter, so quoting it would be a way to put chosen words in front of a
-user who trusts this app.
-
-Relaying is also the end of the recovery, not a repair. The workbench keeps the ids
-it is waiting for in an in-memory `Set` that is never persisted, so a relayed value
-is consumable only by the page instance that began the sign-in. That is also why
-the forced reload after five minutes in the background is downgraded to the
-IndexedDB health check while any launch is still inside its window: reloading
-discards the very requests the callback is coming back to, and five minutes away
-is the ordinary shape of a sign-in that needed a second factor. Downgraded rather
-than skipped, because the decision is taken on each return from the background
-and judged on that return's own absence, so nothing comes back later to answer
-one that was skipped. The health check only reloads when IndexedDB is already
-unusable, and such a page has nothing left to collect a callback with.
-
-Request ids do not survive the page. The workbench counts them from a class
-static that is re-initialised on every load, so the same id is handed out again
-after a reload, a folder switch or a renderer recreation. A launch therefore
-moves an id already recorded forward to its own reading rather than keeping the
-earlier one, which would otherwise judge the sign-in in flight by the window of
-one the user had already left behind.
+The workbench's pending requests are in memory. A callback after process loss cannot restore them; the app shows the existing restart notice and requires a fresh sign-in. The actual provider exposes its random document identity through a non-configurable getter without a setter. Bootstrap never writes that identity. Callback delivery snapshots the registered identity and requires the current provider getter to match before writing localStorage, so stale bootstrap metadata cannot admit an old callback into a replacement page. While an active launch remains within its window, returning from the background uses the IndexedDB health check instead of a forced reload so the pending request remains available.
 
 #### Logging
 

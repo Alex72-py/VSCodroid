@@ -1007,22 +1007,10 @@ class MainActivity : AppCompatActivity() {
             Logger.w(tag, "Ignoring a sign-in callback that no sign-in was waiting for")
             return
         }
-        // Everything checked so far is guessable from outside. The id is a counter
-        // the workbench starts at one for each page, this filter is exported and
-        // BROWSABLE, and the window below is ten minutes, so proving that this app
-        // armed this id proves nothing about who is answering it.
-        //
-        // The secret the workbench minted for this request is what closes that. It
-        // was read out of the address this app was asked to open (patch 0019 puts
-        // it in the callback URL beside `vscode-reqid`), it left the device with
-        // the provider, and it comes back in the query the browser is redirected
-        // to. Nothing serves it: the secret it replaces was bound into
-        // `callback.html`, which `/callback` hands to any app on the device over
-        // loopback without the connection token, measured on an API 33 emulator.
-        //
-        // Refused in the same silence as the branch above and before the window is
-        // consulted, so a forged callback can neither raise a message nor spend the
-        // arming the user's real callback still needs.
+        // The workbench registers this immutable nonce when it creates the
+        // callback URI. Outgoing URL text can activate that identity but cannot
+        // create or replace it. Check before expiry so an invalid return neither
+        // retires the pending request nor raises its timeout notice.
         val offered = callbackNonce(uri.getQueryParameter("data"))
         if (!callbackSecretMatches(offered, AuthTabWindow.nonceFor(requestId))) {
             Logger.w(tag, "Ignoring a sign-in callback that did not carry this request's secret")
@@ -1035,17 +1023,10 @@ class MainActivity : AppCompatActivity() {
             // longer than the window, and the alternative is an editor that
             // simply never signs in and never says why.
             //
-            // Taken back as the message goes up, and that is what keeps the
-            // message from becoming something an outside caller can operate. The
-            // filter is exported and BROWSABLE and the id is an integer counted
-            // from one, so anything on the device can name a launch the user
-            // really made; with the record consumed here, each launch can produce
-            // this message once, and every repeat falls into the silent branch
-            // above. Only the arrival past the window consumes it -- an accepted
-            // callback leaves the record alone, because the forced reload asks
-            // whether a sign-in is still in flight and the workbench collects the
-            // relayed value asynchronously.
-            AuthTabWindow.disarm(listOf(requestId))
+            // Reserve the identity until this document is replaced, but hide it
+            // from subsequent arrivals so this notice is shown once. Removing it
+            // would let another address rearm the same pending request.
+            AuthTabWindow.expire(requestId)
 
             // Fixed text, carrying nothing from the URI. What rides in the
             // callback is attacker-shaped by construction, and a message that
@@ -1154,6 +1135,7 @@ class MainActivity : AppCompatActivity() {
         // this method returns; with the injector left in place it asks a
         // destroyed WebView, which answers by logging and never calling back.
         extraKeyRow?.keyInjector = null
+        (webView?.webViewClient as? VSCodroidWebViewClient)?.disposeAuthPage()
         webView?.destroy()
         webView = null
         super.onDestroy()
@@ -2127,6 +2109,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupWebView() {
+        AuthTabWindow.beginPage()
         webView = findViewById(R.id.webView)
         webView?.let { wv ->
             VSCodroidWebView.configure(wv)
@@ -3601,49 +3584,68 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun injectBridgeToken() {
-        val token = securityManager.getSessionToken()
-        webView?.evaluateJavascript(
-            "window.__vscodroid = window.__vscodroid || {}; window.__vscodroid.authToken = '$token';",
-            null
-        )
-        // Install JS interceptor so ExtraKeyRow Ctrl/Alt modifiers apply to soft keyboard input
-        extraKeyRow?.keyInjector?.setupModifierInterceptor()
-        // Inject safe area CSS for round-corner devices
-        injectSafeAreaCSS()
-        // Set up BroadcastChannel relay so browser extensions can reach AndroidBridge
-        injectBridgeRelay()
-        // Register memory pressure listener
-        injectMemoryPressureHandler()
-        // Fix #2: Inject touch target enlargement CSS for phone-sized screens
-        injectTouchTargetCSS()
-        // Keeps the soft keyboard down until the user aims at text
-        injectKeyboardGuard()
-        // Keeps a context menu open while the keyboard is up, and Escape able to close it
-        injectTouchContextMenu()
-        // Keeps an inline list edit (New File, Rename) in view when the keyboard rises
-        injectListEditKeeper()
-        // Makes Enter on the soft keyboard commit an inline edit or a Quick Open pick,
-        // and the quick input's keys work while a word is composing
-        injectComposingEnter()
-        // Shows the page's background, not the dismantled workbench, from the moment the
-        // page is told to leave until the next one paints
-        injectLeaveCurtain()
-        // Fix #7: Override window.open() to route through AndroidBridge
-        injectWindowOpenOverride()
-        // Answers a paste out of Android's clipboard, which the WebView will not
-        injectClipboardReadFallback()
-        // Keeps a downloaded blob readable long enough to be saved, and names it
-        injectDownloadCapture()
-        // Open in Browser, SSH keys and About are contributed by the bundled bridge
-        // extension, which registers them through the extension API and reaches Android
-        // over the relay below. They cannot be injected from here: the workbench is an
-        // ES module and the AMD loader those injections needed does not exist.
+        val targetView = webView ?: return
+        val client = targetView.webViewClient as? VSCodroidWebViewClient ?: return
+        val page = client.authPage(targetView) ?: return
+        val token = JSONObject.quote(securityManager.getSessionToken())
+        val origin = JSONObject.quote(page.origin)
+        val generation = page.generation
+        targetView.evaluateJavascript("""
+            (function() {
+                if (window !== window.top || location.origin !== $origin || location.pathname !== '/') return null;
+                var metadata = window.__vscodroid = window.__vscodroid || {};
+                metadata.authToken = $token;
+                metadata.pageGeneration = $generation;
+                metadata.authCallbacksReady = true;
+                window.dispatchEvent(new Event('vscodroid-bridge-ready'));
+                return [$generation, metadata.authCallbacksReady === true];
+            })();
+        """.trimIndent()) { result ->
+            if (webView !== targetView || client.authPage(targetView)?.generation != generation) return@evaluateJavascript
+            if (!authBootstrapSucceeded(result, generation)) {
+                client.completeAuthBootstrap(targetView, generation, false)
+                return@evaluateJavascript
+            }
+            // Install JS interceptor so ExtraKeyRow Ctrl/Alt modifiers apply to soft keyboard input
+            extraKeyRow?.keyInjector?.setupModifierInterceptor()
+            // Inject safe area CSS for round-corner devices
+            injectSafeAreaCSS()
+            // Set up BroadcastChannel relay so browser extensions can reach AndroidBridge
+            injectBridgeRelay()
+            // Register memory pressure listener
+            injectMemoryPressureHandler()
+            // Enlarge touch targets for phone-sized screens.
+            injectTouchTargetCSS()
+            // Keeps the soft keyboard down until the user aims at text
+            injectKeyboardGuard()
+            // Keeps a context menu open while the keyboard is up, and Escape able to close it
+            injectTouchContextMenu()
+            // Keeps an inline list edit (New File, Rename) in view when the keyboard rises
+            injectListEditKeeper()
+            // Makes Enter on the soft keyboard commit an inline edit or a Quick Open pick,
+            // and the quick input's keys work while a word is composing
+            injectComposingEnter()
+            // Shows the page's background, not the dismantled workbench, from the moment the
+            // page is told to leave until the next one paints
+            injectLeaveCurtain()
+            // Route window.open() through AndroidBridge.
+            injectWindowOpenOverride()
+            // Answers a paste out of Android's clipboard, which the WebView will not
+            injectClipboardReadFallback()
+            // Keeps a downloaded blob readable long enough to be saved, and names it
+            injectDownloadCapture()
+            // Open in Browser, SSH keys and About are contributed by the bundled bridge
+            // extension, which registers them through the extension API and reaches Android
+            // over the relay below. They cannot be injected from here: the workbench is an
+            // ES module and the AMD loader those injections needed does not exist.
 
-        // Last, because everything above is what makes the page able to receive
-        // an auth callback at all. From here a callback arriving through
-        // onNewIntent goes straight into this page, which is the only page that
-        // can consume one.
-        workbenchLoaded = true
+            // Last, because everything above is what makes the page able to receive
+            // an auth callback at all. From here a callback arriving through
+            // onNewIntent goes straight into this page, which is the only page that
+            // can consume one.
+            workbenchLoaded = true
+            client.completeAuthBootstrap(targetView, generation, true)
+        }
     }
 
     /**
@@ -6296,6 +6298,7 @@ class MainActivity : AppCompatActivity() {
         // ExtraKeyRow null-guards every use, so it does nothing until a live one
         // arrives, which is the right thing for a row with no page under it.
         extraKeyRow?.keyInjector = null
+        (wv.webViewClient as? VSCodroidWebViewClient)?.disposeAuthPage()
         wv.destroy()
 
         val newWebView = WebView(this)
@@ -6412,9 +6415,17 @@ class MainActivity : AppCompatActivity() {
         Logger.i(tag, "Extension callback relay received")
         val key = JSONObject.quote("vscode-web.url-callbacks[$requestId]")
         val value = JSONObject.quote(callbackUri)
-        webView?.evaluateJavascript("""
+        val targetView = webView ?: return
+        val page = (targetView.webViewClient as? VSCodroidWebViewClient)?.authPage(targetView) ?: return
+        val generation = page.generation
+        val documentId = JSONObject.quote(AuthTabWindow.documentIdFor(requestId) ?: return)
+        val origin = JSONObject.quote(page.origin)
+        targetView.evaluateJavascript("""
             (function() {
                 try {
+                    if (window.__vscodroidCallbackDocumentId !== $documentId) return;
+                    if (window !== window.top || location.origin !== $origin || location.pathname !== '/' ||
+                        (window.__vscodroid || {}).pageGeneration !== $generation) return;
                     var key = $key;
                     var value = $value;
                     localStorage.setItem(key, value);
@@ -6927,27 +6938,9 @@ internal fun callbackQueryWithoutNonce(query: String): String =
     query.split('&').filterNot { it.substringBefore('=') == CALLBACK_NONCE_PARAM }
         .joinToString("&")
 
-/**
- * Whether a callback proves it answers the launch this app made for it.
- *
- * [expected] is the secret the address this app opened carried, or null when it
- * carried none. Null means this app never had a secret to match, not that a
- * caller withheld one, so it answers true and leaves the matching where it was
- * before the secret existed: an address whose callback URL this app could not
- * read must not cost the user their ability to sign in at all.
- *
- * The other direction is deliberate and is not a fallback: a launch that DID
- * carry a secret refuses a callback that arrives without one. A provider that
- * drops unknown parameters from the redirect it was given therefore loses that
- * sign-in, and the alternative is worse, since omitting a parameter is free for
- * anything on the device that wants to answer a request id it guessed.
- *
- * Compared with [MessageDigest.isEqual] rather than `==`, which is the
- * comparison this codebase uses for a secret elsewhere and costs nothing here.
- */
+/** The return must carry the nonce registered by this document's callback provider. */
 internal fun callbackSecretMatches(offered: String?, expected: String?): Boolean {
-    if (expected.isNullOrEmpty()) return true
-    if (offered.isNullOrEmpty()) return false
+    if (expected.isNullOrEmpty() || offered.isNullOrEmpty()) return false
     return MessageDigest.isEqual(
         offered.toByteArray(Charsets.UTF_8),
         expected.toByteArray(Charsets.UTF_8),
@@ -7923,4 +7916,13 @@ internal class AppNavigationMark(private val windowMs: Long) {
         markedAt = 0L
         return true
     }
+}
+
+/** Accept only the completed bootstrap for the document that requested it. */
+internal fun authBootstrapSucceeded(result: String?, generation: Long): Boolean = try {
+    val marker = JSONArray(result ?: "null")
+    marker.length() == 2 && marker.opt(0) is Number && marker.getLong(0) == generation &&
+        marker.getDouble(0) == generation.toDouble() && marker.opt(1) == true
+} catch (_: JSONException) {
+    false
 }

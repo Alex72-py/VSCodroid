@@ -1,47 +1,71 @@
-Give every callback URL a secret of its own.
+Register each sign-in identity when the workbench creates it.
 
-The relay patch 0006 adds hands an extension sign-in back to the app through
-`vscodroid://callback`, whose filter is exported and BROWSABLE, and the request
-id it names is a counter the workbench restarts at one with every page. What
-told a real callback from a forged one was a per-run secret `server.js` wrote
-into `callback.html`, and that page is served by `/callback`, which patch 0012
-answers before the connection token check. Measured on an API 33 emulator: a
-plain `GET /callback` from another uid over loopback returns the page with the
-secret in it, so any installed app could read it and then fire the filter with
-an OAuth result of its own for a sign-in the user had in flight.
+The native callback relay accepts only identities registered by the workbench,
+so an unrelated outgoing address cannot replace or reserve a callback nonce.
+Requests created before bridge initialization wait in a bounded private queue.
+The bridge-ready event flushes that queue and reports registration failure
+explicitly before deferred browser launches are released.
 
-So the secret is minted here instead, one per request, in the callback URL the
-extension receives from `asExternalUri` and uses as its redirect. It leaves the
-device with the provider and comes back in the query the browser is redirected
-to, which `callback.html` already hands to the app inside `uri`. Nothing serves
-it: the app compares what arrives with what it read out of the address it was
-asked to open, and `/callback` fetched by anything else carries no secret at
-all.
-
-What this does not cover, and cannot: the provider sees the redirect URL, so a
-provider that keeps it could answer for that one request. That party is the one
-the user is signing in to and the one the real callback comes from, and the
-value is spent when the sign-in completes.
-
-`crypto.getRandomValues` rather than `Math.random`, because this is a secret and
-the page already requires a secure context.
+The provider also owns an immutable document identity so a queued return cannot
+be delivered into a replacement page that reuses the same numeric request id.
 
 diff --git a/src/vs/code/browser/workbench/workbench.ts b/src/vs/code/browser/workbench/workbench.ts
-index 1111111..2222222 100644
 --- a/src/vs/code/browser/workbench/workbench.ts
 +++ b/src/vs/code/browser/workbench/workbench.ts
-@@ -319,6 +319,18 @@ class LocalStorageURLCallbackProvider extends Disposable implements IURLCallbackP
+@@ -308,17 +308,60 @@
+ 	readonly onCallback = this._onCallback.event;
+ 
+ 	private pendingCallbacks = new Set<number>();
++	private readonly androidCallbacks = new Map<number, string>();
++	private readonly androidDocumentId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
++		.map(b => b.toString(16).padStart(2, '0')).join('');
+ 	private lastTimeChecked = Date.now();
+ 	private checkCallbacksTimeout: Timeout | undefined = undefined;
+ 	private onDidChangeLocalStorageDisposable: IDisposable | undefined;
+ 
+ 	constructor(private readonly _callbackRoute: string) {
+ 		super();
++		Object.defineProperty(mainWindow, '__vscodroidCallbackDocumentId', { get: () => this.androidDocumentId });
++		this._register(addDisposableListener(mainWindow, 'vscodroid-bridge-ready', () => {
++			try {
++				this.flushAndroidCallbacks();
++			} catch (error) {
++				console.error(error);
++			}
++		}));
++		this.flushAndroidCallbacks();
++	}
++
++	private flushAndroidCallbacks(): void {
++		const browser = mainWindow as typeof mainWindow & {
++			AndroidBridge?: { registerAuthCallback(id: string, nonce: string, documentId: string, generation: number, token: string): boolean };
++			__vscodroid?: { authToken?: string; pageGeneration?: number; authCallbacksReady?: boolean };
++		};
++		if (!browser.AndroidBridge) {
++			this.androidCallbacks.clear();
++			return;
++		}
++		const metadata = browser.__vscodroid;
++		if (!metadata?.authToken || !Number.isSafeInteger(metadata.pageGeneration)) {
++			return;
++		}
++		try {
++			for (const [id, nonce] of this.androidCallbacks) {
++				if (!browser.AndroidBridge.registerAuthCallback(String(id), nonce, this.androidDocumentId, metadata.pageGeneration!, metadata.authToken)) {
++					throw new Error('The editor could not register this sign-in request. Reload the editor and try again.');
++				}
++				this.androidCallbacks.delete(id);
++			}
++		} catch (error) {
++			metadata.authCallbacksReady = false;
++			throw error;
++		}
+ 	}
+ 
  	create(options: Partial<UriComponents> = {}): URI {
  		const id = ++LocalStorageURLCallbackProvider.REQUEST_ID;
  		const queryParams: string[] = [`vscode-reqid=${id}`];
 +
-+		// A secret this request alone carries, so the Android side can tell the
-+		// browser's real callback from an intent any app on the device may fire.
-+		// It rides out in the redirect the extension registers, comes back in the
-+		// query, and reaches the app inside the payload callback.html builds. The
-+		// secret it replaces was written into that page by the server, which
-+		// answers /callback before the connection token check, so anything on the
-+		// device could read it over loopback.
 +		const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)))
 +			.map(b => b.toString(16).padStart(2, '0'))
 +			.join('');
@@ -49,3 +73,20 @@ index 1111111..2222222 100644
  
  		for (const key of LocalStorageURLCallbackProvider.QUERY_KEYS) {
  			const value = options[key];
+@@ -332,6 +375,16 @@
+ 		// https://github.com/microsoft/vscode-dev/issues/62
+ 		// https://github.com/microsoft/vscode/blob/159479eb5ae451a66b5dac3c12d564f32f454796/extensions/github-authentication/src/githubServer.ts#L50-L50
+ 		if (!(options.authority === 'vscode.github-authentication' && options.path === '/dummy')) {
++			if (this.androidCallbacks.size >= 32) {
++				throw new Error('Too many pending sign-in requests. Reload the editor and try again.');
++			}
++			this.androidCallbacks.set(id, nonce);
++			try {
++				this.flushAndroidCallbacks();
++			} catch (error) {
++				this.androidCallbacks.delete(id);
++				throw error;
++			}
+ 			const key = `vscode-web.url-callbacks[${id}]`;
+ 			localStorage.removeItem(key);
+ 

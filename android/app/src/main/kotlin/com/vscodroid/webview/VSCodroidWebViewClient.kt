@@ -22,6 +22,7 @@ import com.vscodroid.bridge.authCallbackNonceIn
 import com.vscodroid.bridge.authRequestIdsIn
 import com.vscodroid.bridge.encodeCallbackState
 import com.vscodroid.isExtensionCallback
+import com.vscodroid.isWorkbenchUrl
 import com.vscodroid.service.RESTART_DELAY_MS
 import com.vscodroid.util.CrashReporter
 import com.vscodroid.util.EditorLocale
@@ -844,6 +845,59 @@ class VSCodroidWebViewClient(
 
     private val tag = "WebViewClient"
 
+    data class AuthPage(val view: WebView, val generation: Long, val origin: String)
+    private var authPage: AuthPage? = null
+    private var authReady = false
+    private val deferredAuth = java.util.ArrayDeque<Uri>()
+    private var authTimeout: Runnable? = null
+
+    fun authPage(view: WebView): AuthPage? = authPage?.takeIf {
+        it.view === view && it.generation == AuthTabWindow.pageGeneration() &&
+            trustedAuthOrigin(view.url) == it.origin
+    }
+
+    private fun trustedAuthOrigin(address: String?): String? {
+        if (!isWorkbenchUrl(address, allowedPort)) return null
+        val parsed = runCatching { URI(address) }.getOrNull() ?: return null
+        return if (parsed.scheme == "http") "http://${parsed.host}:${parsed.port}" else null
+    }
+
+    private fun clearAuthWait() {
+        authTimeout?.let { authPage?.view?.removeCallbacks(it) }
+        authTimeout = null
+        deferredAuth.clear()
+    }
+
+    fun disposeAuthPage() {
+        clearAuthWait()
+        authReady = false
+        authPage = null
+    }
+
+    private fun failAuthBootstrap() {
+        val first = deferredAuth.peekFirst()
+        clearAuthWait()
+        authReady = false
+        if (first != null) onHandoffFailed(first, IllegalStateException("The editor bridge is not ready"))
+    }
+
+    fun completeAuthBootstrap(view: WebView, generation: Long, succeeded: Boolean): Boolean {
+        val page = authPage(view) ?: return false
+        if (page.generation != generation) return false
+        if (!succeeded) {
+            failAuthBootstrap()
+            return false
+        }
+        authReady = true
+        val waiting = deferredAuth.toList()
+        clearAuthWait()
+        waiting.forEach { target ->
+            if (authPage(view) === page) openExternal(view, target, true, true, requireIssued = true)
+        }
+        return true
+    }
+
+
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
         val declined = declinesLoading(view, request)
         // Once, here, and not at each `return true` below: they are a refusal
@@ -980,119 +1034,57 @@ class VSCodroidWebViewClient(
             Logger.w(tag, "Refused to open this app's own sign-in callback")
             return true
         }
-        // Empty until this launch arms something, and then the ids to take back
-        // if the launch throws. Same shape as `AndroidBridge.openExternalUrl`,
-        // and for the same reason: arming precedes the launch, so a launch
-        // nothing accepted would otherwise leave the relay open with no sign-in
-        // in flight.
-        var armed: List<String> = emptyList()
-        // Fix #7: Open external URLs in system browser instead of blocking silently
-        try {
-            // The Microsoft sign-in's callback, repaired as the bridge repairs it:
-            // the same `window.open` lands here whenever the bridge declines it.
-            val address = encodeCallbackState(url.toString())
-            val target = if (address == url.toString()) url else address.toUri()
-            val intent = Intent(Intent.ACTION_VIEW, target)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            // The app's second way out to a browser, and the one that recorded
-            // nothing. The bridge is the route the workbench normally takes, but
-            // `MainActivity.injectWindowOpenOverride` falls through to a plain
-            // navigation whenever the page holds no session token yet or the
-            // bridge reports no launch, and the workbench's own opener assigns
-            // `location.href` for every scheme that is not http or https. A
-            // sign-in leaving either way returns by the same
-            // `vscodroid://callback` and was judged against a window nobody had
-            // opened, so it was refused in the log and the sign-in hung with
-            // nothing said.
-            //
-            // Main frame only, and that is the boundary rather than a detail.
-            // Both routes above navigate the top-level frame: the injected
-            // override patches the main window's `window.open`, and the opener
-            // assigns the main window's `location`. Nothing else here is our
-            // own page. Every other frame renders content this app does not
-            // vouch for, including the remote site the bundled simple browser
-            // puts in an iframe, and a frame may always navigate itself whatever
-            // its sandbox says. Arming on those would let a page the user merely
-            // opened choose which callback ids this app accepts, and evict the
-            // sign-in actually in flight from a record that keeps the most
-            // recent few. The bridge route is gated by the session token; this
-            // one has no token to check, so the frame is what stands in for it.
-            //
-            // What is armed is the request ids the address carries, never the
-            // fact that a browser opened: a documentation link carries none and
-            // so opens nothing, which is what keeps this from widening the
-            // window every external link is followed.
-            if (request.isForMainFrame) {
-                armed = AuthTabWindow.arm(
-                    authRequestIdsIn(address),
-                    authCallbackNonceIn(address),
-                    SystemClock.elapsedRealtime(),
-                )
+        val address = encodeCallbackState(url.toString())
+        val target = if (address == url.toString()) url else address.toUri()
+        val hasAuthMetadata = authRequestIdsIn(address).isNotEmpty()
+        if (request.isForMainFrame && hasAuthMetadata) {
+            val page = authPage(view)
+            if (page == null) {
+                onHandoffFailed(target, IllegalStateException("No active editor document"))
+                return true
             }
-            view.context.startActivity(intent)
-            // The address itself is not repeated, for the reason [urlLogLabel]
-            // gives: it is the page's to choose and its query is where a sign-in
-            // puts an OAuth code. This line is at `Logger.i`, which is not gated on
-            // a debuggable build, so it ships.
-            Logger.i(tag, "Opened an external URL at ${urlLogLabel(url.toString())}")
-        } catch (e: Exception) {
-            AuthTabWindow.disarm(armed)
-            // Two channels, and both of them are closed here rather than one. The
-            // address is reduced to a scheme and a host by [urlLogLabel], because
-            // it is the page's to choose and its query is where a sign-in puts an
-            // OAuth code. And the throwable is deliberately not passed: leaving it
-            // in was a redaction that only looked like one, since
-            // `Log.e(tag, msg, tr)` prints the throwable with its message and both
-            // exceptions this realistically catches put the whole address there.
-            // ActivityNotFoundException quotes the Intent it could not match,
-            // `dat=` and all, and FileUriExposedException names the file it
-            // refused, so whatever the message had left out arrived in logcat two
-            // lines below it on a statement that is not gated on a debuggable build
-            // and therefore ships. The frames behind it are all framework, so the
-            // class name is what the trace was being read for anyway. Same shape
-            // and same reasoning as `AndroidBridge.openExternalUrl`.
-            Logger.e(
-                tag,
-                "Could not open an external URL at ${urlLogLabel(url.toString())} " +
-                    "(${e.javaClass.simpleName})"
-            )
-            // A link the user taps in a preview or in the simple browser still
-            // leaves for a browser: the gate above lets a subframe navigation
-            // through once a gesture is behind it. What is gated here is only the
-            // notice, and it is gated on the same signal for a second reason.
-            //
-            // It has to be, because this callback receives subframe navigations
-            // and the frames are not all ours. A script can navigate an iframe to
-            // a scheme nothing on the device answers, with no user gesture and as
-            // often as it likes, and each failure was an unconditional
-            // `Toast.LENGTH_LONG` -- about three and a half seconds of screen,
-            // stacking rather than replacing. That is a rendered page holding a
-            // sustained stream of notices over a live editor, and the content that
-            // reaches this client includes the bundled simple browser holding an
-            // arbitrary remote site plus previews and notebook output built from
-            // workspace files.
-            //
-            // `hasGesture()` is the request's own record of whether a user gesture
-            // was associated with the navigation, so it answers the question a
-            // notice depends on: did the user do this. It is a disjunction with the
-            // frame test rather than a conjunction, and the asymmetry is deliberate.
-            // The main frame is the workbench, the one document here this app
-            // serves, and it is also where both routes this channel backs up
-            // navigate: `injectWindowOpenOverride` falls through to a plain
-            // navigation, and the workbench's own opener assigns `location.href`
-            // for every scheme that is not http or https. Whether user activation
-            // survives those chains is not measured here, and losing the notice on
-            // them would silence exactly the case it was added for, a sign-in or an
-            // `ssh:` clone link that no app answers. So the main frame keeps its
-            // notice unconditionally, and the gesture is what still earns one for a
-            // link the user genuinely tapped inside a preview. Only a navigation
-            // that is neither our own page nor something the user did is silent,
-            // and it stays in the log line above.
-            if (request.isForMainFrame || request.hasGesture()) {
-                onHandoffFailed(url, e)
+            if (!authReady) {
+                if (deferredAuth.size >= 32) {
+                    onHandoffFailed(target, IllegalStateException("Too many waiting sign-in launches"))
+                } else {
+                    deferredAuth.addLast(target)
+                    if (authTimeout == null) {
+                        val timeout = Runnable {
+                            if (authPage === page) failAuthBootstrap()
+                        }
+                        authTimeout = timeout
+                        view.postDelayed(timeout, 30_000L)
+                    }
+                }
+                return true
             }
         }
-        return true  // Don't navigate WebView to external URL
+        openExternal(view, target, request.isForMainFrame, request.isForMainFrame || request.hasGesture())
+        return true
+    }
+
+    private fun openExternal(
+        view: WebView, target: Uri, mainFrame: Boolean, announce: Boolean,
+        requireIssued: Boolean = false,
+    ) {
+        var armed: AuthTabWindow.Attempt? = null
+        try {
+            if (mainFrame) {
+                armed = AuthTabWindow.arm(authRequestIdsIn(target.toString()),
+                    authCallbackNonceIn(target.toString()), SystemClock.elapsedRealtime(),
+                    AuthTabWindow.pageGeneration())
+                check(!requireIssued || !armed.isEmpty()) { "The editor did not issue this sign-in request" }
+            }
+            val intent = Intent(Intent.ACTION_VIEW, target).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+            view.context.startActivity(intent)
+            armed?.let { AuthTabWindow.launched(it) }
+            Logger.i(tag, "Opened an external URL at ${urlLogLabel(target.toString())}")
+        } catch (error: Exception) {
+            armed?.let { AuthTabWindow.disarm(it) }
+            Logger.e(tag, "Could not open an external URL at ${urlLogLabel(target.toString())} " +
+                "(${error.javaClass.simpleName})")
+            if (announce) onHandoffFailed(target, error)
+        }
     }
 
     /**
@@ -1210,6 +1202,9 @@ class VSCodroidWebViewClient(
     }
 
     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+        disposeAuthPage()
+        AuthTabWindow.beginPage()
+        trustedAuthOrigin(url)?.let { authPage = AuthPage(view, AuthTabWindow.pageGeneration(), it) }
         // The URL the activity navigates to carries the connection token in its
         // query, so this is one of the two callbacks handed the very string
         // MainActivity took care not to print. See [redactToken].
@@ -1327,11 +1322,14 @@ class VSCodroidWebViewClient(
             )
         }
         if (request.isForMainFrame) {
+            disposeAuthPage()
+            AuthTabWindow.beginPage()
             Logger.e(tag, "Page load error: ${error.errorCode} - ${error.description}")
         }
     }
 
     override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+        disposeAuthPage()
         Logger.e(tag, "Render process gone! didCrash=${detail.didCrash()}")
         CrashReporter.recordRendererDeath(view.context, detail)
         onCrash()

@@ -90,7 +90,7 @@ class ExternalUrlHandoffTest {
          */
         const val SIGN_IN =
             "https://github.com/login/oauth/authorize?client_id=abc" +
-                "&state=http%253A%252F%252F127.0.0.1%253A13337%252Fcallback%253Fvscode-reqid%253D909"
+                "&state=http%253A%252F%252F127.0.0.1%253A13337%252Fcallback%253Fvscode-reqid%253D909&vscodroid-nonce=652e5a9f8c1d4b07a3e6f95204c8b71d"
 
         /** The id [SIGN_IN] carries. */
         const val SIGN_IN_REQUEST_ID = "909"
@@ -217,9 +217,7 @@ class ExternalUrlHandoffTest {
      */
     @AfterEach
     fun handBackArmedRequests() {
-        AuthTabWindow.disarm(
-            listOf(SIGN_IN_REQUEST_ID, UNSOLICITED_REQUEST_ID, DOCS_NUMBER, OWN_CALLBACK_REQUEST_ID)
-        )
+        AuthTabWindow.beginPage()
     }
 
     /** Every hand-off failure the client announced, in order. */
@@ -275,6 +273,11 @@ class ExternalUrlHandoffTest {
             },
             onNavigationDeclined = { declined += 1 },
         )
+        every { view.url } returns "http://127.0.0.1:$ALLOWED_PORT/"
+        client.onPageStarted(view, view.url, null)
+        AuthTabWindow.register(SIGN_IN_REQUEST_ID, SIGN_IN_SECRET, "d".repeat(32), AuthTabWindow.pageGeneration())
+        client.completeAuthBootstrap(view, AuthTabWindow.pageGeneration(), true)
+
     }
 
     /**
@@ -544,6 +547,166 @@ class ExternalUrlHandoffTest {
      * answer the sign-in going out through here.
      */
     @Test
+    fun `a main-frame address cannot preseed a callback id the provider has not issued`() {
+        val prefix = "https://example.com/?vscode-reqid=1"
+        client.shouldOverrideUrlLoading(view, request("https", "example.com", -1,
+            "$prefix&vscodroid-nonce=${"b".repeat(32)}"))
+        client.shouldOverrideUrlLoading(view, request("https", "example.com", -1, prefix))
+        assertNull(AuthTabWindow.nonceFor("1"))
+        assertNull(AuthTabWindow.armedAt("1"))
+        AuthTabWindow.register("1", "a".repeat(32), "d".repeat(32), AuthTabWindow.pageGeneration())
+        client.shouldOverrideUrlLoading(view, request("https", "example.com", -1,
+            "$prefix&vscodroid-nonce=${"a".repeat(32)}"))
+        assertEquals("a".repeat(32), AuthTabWindow.nonceFor("1"))
+        assertTrue(callbackWouldBeTaken("1"))
+        assertFalse(callbackSecretWouldMatch("1", "b".repeat(32)))
+    }
+
+    @Test
+    fun `an early main-frame auth navigation waits for issued identity and completed bootstrap`() {
+        client.onPageStarted(view, view.url, null)
+        val generation = AuthTabWindow.pageGeneration()
+        client.shouldOverrideUrlLoading(view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET))
+        assertNull(AuthTabWindow.armedAt(SIGN_IN_REQUEST_ID))
+        verify(exactly = 0) { context.startActivity(any()) }
+
+        assertTrue(AuthTabWindow.register(SIGN_IN_REQUEST_ID, SIGN_IN_SECRET, "d".repeat(32), generation))
+        assertTrue(client.completeAuthBootstrap(view, generation, true))
+        verify(exactly = 1) { context.startActivity(any()) }
+        assertTrue(callbackWouldBeTaken(SIGN_IN_REQUEST_ID))
+        assertTrue(callbackSecretWouldMatch(SIGN_IN_REQUEST_ID, SIGN_IN_SECRET))
+    }
+
+    @Test
+    fun `a queued unissued address cannot create authority when bootstrap completes`() {
+        client.onPageStarted(view, view.url, null)
+        client.shouldOverrideUrlLoading(view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET))
+        client.completeAuthBootstrap(view, AuthTabWindow.pageGeneration(), true)
+        assertNull(AuthTabWindow.nonceFor(SIGN_IN_REQUEST_ID))
+        verify(exactly = 0) { context.startActivity(any()) }
+        assertEquals(1, announced.size)
+    }
+
+    @Test
+    fun `failed bootstrap leaves deferred browsers unlaunched and permits a later user retry`() {
+        client.onPageStarted(view, view.url, null)
+        val generation = AuthTabWindow.pageGeneration()
+        AuthTabWindow.register(SIGN_IN_REQUEST_ID, SIGN_IN_SECRET, "d".repeat(32), generation)
+        client.shouldOverrideUrlLoading(view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET))
+        assertFalse(client.completeAuthBootstrap(view, generation, false))
+        assertEquals(1, announced.size)
+        assertNull(AuthTabWindow.armedAt(SIGN_IN_REQUEST_ID))
+        verify(exactly = 0) { context.startActivity(any()) }
+        assertTrue(client.completeAuthBootstrap(view, generation, true))
+        client.shouldOverrideUrlLoading(view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET))
+        verify(exactly = 1) { context.startActivity(any()) }
+    }
+
+    @Test
+    fun `deferred auth has one fixed deadline and queue overflow never evicts earlier launches`() {
+        val deadlines = mutableListOf<Runnable>()
+        every { view.postDelayed(any(), 30_000L) } answers { deadlines += firstArg<Runnable>(); true }
+        client.onPageStarted(view, view.url, null)
+        val generation = AuthTabWindow.pageGeneration()
+        AuthTabWindow.register(SIGN_IN_REQUEST_ID, SIGN_IN_SECRET, "d".repeat(32), generation)
+        repeat(33) {
+            client.shouldOverrideUrlLoading(view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET))
+        }
+        assertEquals(1, deadlines.size)
+        assertEquals(1, announced.size)
+        verify(exactly = 0) { context.startActivity(any()) }
+        deadlines.single().run()
+        assertEquals(2, announced.size)
+        assertNull(AuthTabWindow.armedAt(SIGN_IN_REQUEST_ID))
+        client.completeAuthBootstrap(view, generation, true)
+        verify(exactly = 0) { context.startActivity(any()) }
+        verify(exactly = 1) { view.removeCallbacks(deadlines.single()) }
+    }
+
+    @Test
+    fun `queue overflow preserves all earlier deferred launches for a successful drain`() {
+        client.onPageStarted(view, view.url, null)
+        val generation = AuthTabWindow.pageGeneration()
+        AuthTabWindow.register(SIGN_IN_REQUEST_ID, SIGN_IN_SECRET, "d".repeat(32), generation)
+        repeat(33) {
+            client.shouldOverrideUrlLoading(view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET))
+        }
+        assertEquals(1, announced.size)
+        assertTrue(client.completeAuthBootstrap(view, generation, true))
+        verify(exactly = 32) { context.startActivity(any()) }
+        assertTrue(callbackWouldBeTaken(SIGN_IN_REQUEST_ID))
+    }
+
+    @Test
+    fun `a replacement WebView rejects the previous completion and deferred deadline`() {
+        val deadlines = mutableListOf<Runnable>()
+        every { view.postDelayed(any(), 30_000L) } answers { deadlines += firstArg<Runnable>(); true }
+        client.onPageStarted(view, view.url, null)
+        val generation = AuthTabWindow.pageGeneration()
+        client.shouldOverrideUrlLoading(view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET))
+        val replacement = mockk<WebView>(relaxed = true)
+        every { replacement.url } returns "http://127.0.0.1:$ALLOWED_PORT/"
+        client.onPageStarted(replacement, replacement.url, null)
+        assertFalse(client.completeAuthBootstrap(view, generation, true))
+        deadlines.single().run()
+        assertTrue(announced.isEmpty())
+        verify(exactly = 0) { context.startActivity(any()) }
+        assertNull(AuthTabWindow.nonceFor(SIGN_IN_REQUEST_ID))
+    }
+
+    @Test
+    fun `another browser handoff cannot replace the pending sign-in identity`() {
+        client.shouldOverrideUrlLoading(view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET))
+        client.shouldOverrideUrlLoading(view, request("https", "example.com", -1, SIGN_IN))
+        client.shouldOverrideUrlLoading(view, request("https", "example.com", -1,
+            SIGN_IN_WITH_SECRET.replace(SIGN_IN_SECRET, "b".repeat(32))))
+
+        assertTrue(callbackWouldBeTaken(SIGN_IN_REQUEST_ID))
+        assertTrue(callbackSecretWouldMatch(SIGN_IN_REQUEST_ID, SIGN_IN_SECRET))
+        assertFalse(callbackSecretWouldMatch(SIGN_IN_REQUEST_ID, null))
+        assertFalse(callbackSecretWouldMatch(SIGN_IN_REQUEST_ID, "b".repeat(32)))
+        verify(exactly = 3) { context.startActivity(any()) }
+    }
+
+    @Test
+    fun `only a trusted owned root document can complete auth bootstrap`() {
+        val previous = AuthTabWindow.pageGeneration()
+        for (address in listOf("about:blank", "data:text/html,error", "https://example.com/",
+            "https://127.0.0.1:$ALLOWED_PORT/", "http://127.0.0.1:$ALLOWED_PORT/vscode-remote-resource/file")) {
+            every { view.url } returns address
+            client.onPageStarted(view, address, null)
+            assertNull(client.authPage(view))
+            assertFalse(client.completeAuthBootstrap(view, previous, true))
+        }
+        every { view.url } returns "http://127.0.0.1:$ALLOWED_PORT/?folder=/next"
+        client.onPageStarted(view, view.url, null)
+        val current = AuthTabWindow.pageGeneration()
+        assertFalse(client.completeAuthBootstrap(view, previous, true))
+        assertTrue(client.completeAuthBootstrap(view, current, true))
+        AuthTabWindow.register(SIGN_IN_REQUEST_ID, "b".repeat(32), "d".repeat(32), current)
+        client.shouldOverrideUrlLoading(view, request("https", "example.com", -1,
+            SIGN_IN_WITH_SECRET.replace(SIGN_IN_SECRET, "b".repeat(32))))
+        assertTrue(callbackSecretWouldMatch(SIGN_IN_REQUEST_ID, "b".repeat(32)))
+        assertFalse(callbackSecretWouldMatch(SIGN_IN_REQUEST_ID, SIGN_IN_SECRET))
+    }
+
+    @Test
+    fun `a failed handoff cannot roll back a replacement document's request`() {
+        every { context.startActivity(any()) } answers {
+            client.onPageStarted(view, "http://127.0.0.1:$ALLOWED_PORT/", null)
+            AuthTabWindow.register(SIGN_IN_REQUEST_ID, "c".repeat(32), "d".repeat(32), AuthTabWindow.pageGeneration())
+            AuthTabWindow.launched(AuthTabWindow.arm(listOf(SIGN_IN_REQUEST_ID), "c".repeat(32), LAUNCHED_AT))
+            throw ActivityNotFoundException()
+        }
+
+        client.shouldOverrideUrlLoading(view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET))
+
+        assertTrue(callbackWouldBeTaken(SIGN_IN_REQUEST_ID))
+        assertTrue(callbackSecretWouldMatch(SIGN_IN_REQUEST_ID, "c".repeat(32)))
+        assertFalse(callbackSecretWouldMatch(SIGN_IN_REQUEST_ID, SIGN_IN_SECRET))
+    }
+
+    @Test
     fun `the secret the sign-in address carries is recorded with the launch`() {
         client.shouldOverrideUrlLoading(
             view, request("https", "github.com", -1, SIGN_IN_WITH_SECRET)
@@ -584,7 +747,9 @@ class ExternalUrlHandoffTest {
         val repaired = encodeCallbackState(handedOver)
         mockkStatic(Uri::class)
         try {
-            every { Uri.parse(repaired) } returns mockk(relaxed = true)
+            val parsed = mockk<Uri>(relaxed = true)
+            every { parsed.toString() } returns repaired
+            every { Uri.parse(repaired) } returns parsed
 
             client.shouldOverrideUrlLoading(
                 view, request("https", "login.microsoftonline.com", -1, handedOver)
@@ -847,7 +1012,7 @@ class ExternalUrlHandoffTest {
                     "its callback is refused and nothing tells the user why",
             )
         } finally {
-            AuthTabWindow.disarm(crowd)
+            AuthTabWindow.beginPage()
         }
     }
 

@@ -84,198 +84,160 @@ class ExtensionCallbackTest {
  *
  * Plain JVM: the object holds Longs its callers supply and reads no Android API.
  *
- * It is also a process-wide singleton shared with every other test in this JVM,
- * so each case arms ids of its own and hands them back afterwards.
+ * Each case clears the document state afterwards because the record is shared
+ * by every test in this JVM.
  */
 class AuthTabWindowTest {
+    private val original = "a".repeat(32)
+    private val other = "b".repeat(32)
+    private fun issue(id: String = "900001", nonce: String = original, documentId: String = "d".repeat(32)): Boolean =
+        AuthTabWindow.register(id, nonce, documentId, AuthTabWindow.pageGeneration())
 
-    /** Distinctive enough that no other test in this JVM could be arming them. */
-    private val ids = listOf("900001", "900002", "900003")
+    @BeforeEach
+    fun begin() = AuthTabWindow.beginPage()
 
     @AfterEach
-    fun handBack() = AuthTabWindow.disarm(ids)
+    fun finish() = AuthTabWindow.beginPage()
 
     @Test
-    fun `the reading handed in is the reading handed back`() {
-        AuthTabWindow.arm(listOf("900001"), null, 123_456L)
-
-        assertEquals(123_456L, AuthTabWindow.armedAt("900001"))
+    fun `an outgoing address cannot preseed identities or consume issuance capacity`() {
+        for (id in 1..100) AuthTabWindow.arm(listOf(id.toString()), other, 100L)
+        assertNull(AuthTabWindow.armedAt("1"))
+        assertNull(AuthTabWindow.nonceFor("1"))
+        assertTrue(issue("1"))
+        AuthTabWindow.arm(listOf("1"), original, 200L)
+        assertTrue(callbackSecretMatches(original, AuthTabWindow.nonceFor("1")))
+        assertFalse(callbackSecretMatches(other, AuthTabWindow.nonceFor("1")))
+        assertEquals(200L, AuthTabWindow.armedAt("1"))
     }
 
     @Test
-    fun `the secret handed in is the secret handed back, per request`() {
-        // The other half of a launch record, and the half with no behaviour of
-        // its own: the relay compares what a callback carries against what this
-        // returns, and a null answer means "matched by request id alone". So a
-        // record that lost the secret, or handed back a neighbour's, reads as a
-        // launch that never had one and every forged callback naming an armed id
-        // is accepted again.
-        val secret = "a".repeat(32)
-        AuthTabWindow.arm(listOf("900001"), secret, 100L)
-        AuthTabWindow.arm(listOf("900002"), null, 200L)
-
-        assertEquals(secret, AuthTabWindow.nonceFor("900001"))
-        assertNull(
-            AuthTabWindow.nonceFor("900002"),
-            "a launch whose address carried no secret reported one belonging to another",
-        )
-        assertNull(AuthTabWindow.nonceFor("900003"), "an id nobody launched reported a secret")
-
-        // Ids repeat, for the reason the readings above do, and the secret has to
-        // move forward with the reading: keeping the old one refuses the callback
-        // of the sign-in actually in flight.
-        AuthTabWindow.arm(listOf("900001"), "b".repeat(32), 300L)
-        assertEquals("b".repeat(32), AuthTabWindow.nonceFor("900001"))
+    fun `registration rejects malformed or stale identities without reserving them`() {
+        for (id in listOf("", "0", "01", "-1", "+1", "1 ", "999999999999999999999")) {
+            assertFalse(issue(id))
+        }
+        for (nonce in listOf("", "a".repeat(31), "a".repeat(33), "A".repeat(32), "g".repeat(32))) {
+            assertFalse(issue("900001", nonce))
+        }
+        for (documentId in listOf("", "d".repeat(31), "d".repeat(33), "D".repeat(32), "g".repeat(32))) {
+            assertFalse(issue(documentId = documentId))
+        }
+        assertFalse(AuthTabWindow.register("900001", original, "d".repeat(32), AuthTabWindow.pageGeneration() - 1))
+        assertTrue(issue())
+        assertNull(AuthTabWindow.armedAt("900001"))
     }
 
     @Test
-    fun `an id nobody launched is not armed by a launch of another id`() {
-        // The narrowing itself. One timestamp for the whole process answered yes
-        // here, which is how opening a documentation link came to widen the
-        // window an unsolicited callback is accepted in.
-        AuthTabWindow.arm(listOf("900001"), null, 123_456L)
-
-        assertNull(AuthTabWindow.armedAt("900002"))
+    fun `registration is idempotent and the minted nonce remains immutable`() {
+        assertTrue(issue())
+        assertTrue(issue())
+        assertFalse(issue(nonce = other))
+        assertFalse(issue(documentId = "e".repeat(32)))
+        assertEquals("d".repeat(32), AuthTabWindow.documentIdFor("900001"))
+        assertEquals(original, AuthTabWindow.nonceFor("900001"))
+        assertNull(AuthTabWindow.armedAt("900001"))
     }
 
     @Test
-    fun `a second launch arms its own id and leaves the first alone`() {
-        AuthTabWindow.arm(listOf("900001"), null, 100L)
-        AuthTabWindow.arm(listOf("900002"), null, 200L)
-
-        assertEquals(100L, AuthTabWindow.armedAt("900001"), "a later launch overwrote an earlier one")
-        assertEquals(200L, AuthTabWindow.armedAt("900002"))
-    }
-
-    @Test
-    fun `a repeated id is moved forward to the launch that is actually in flight`() {
-        // Ids repeat, which is what makes keeping the first reading the wrong
-        // answer rather than the cautious one. The workbench counts them from one
-        // out of a class static that is re-initialised with the page, so a
-        // reload, a folder switch or a renderer recreation hands the same id to
-        // the next sign-in. Holding the older reading meant a launch from a page
-        // that no longer exists decided the window for the sign-in in flight: the
-        // callback came back in seconds and was refused, with a message telling
-        // the user their sign-in had taken too long.
-        AuthTabWindow.arm(listOf("900001"), null, 1_000L)
-
-        val armed = AuthTabWindow.arm(listOf("900001"), null, 9_000L)
-
-        assertEquals(
-            9_000L, AuthTabWindow.armedAt("900001"),
-            "the window is still being judged from a launch the user has already left behind",
-        )
-        assertEquals(
-            listOf("900001"), armed,
-            "the ids a launch records are the ids its rollback has to take back",
-        )
-    }
-
-    @Test
-    fun `a sign-in started after a page reload is judged from its own launch`() {
-        // The same fact as the case above, carried through to the answer the
-        // relay actually gives, because that is where it was costing something.
-        // A sign-in in the morning arms 900001. Hours later the page reloads --
-        // after a folder switch, a renderer recreation or the resume path -- the
-        // workbench counter starts again, and the next sign-in is handed 900001
-        // too. Its callback comes back thirty seconds later.
-        AuthTabWindow.arm(listOf("900001"), null, 1_000L)
-
-        AuthTabWindow.arm(listOf("900001"), null, 1_201_000L)
-
-        val armedAt = AuthTabWindow.armedAt("900001")
-        assertNotNull(armedAt, "the launch just made was not recorded at all")
-        assertTrue(
-            authCallbackIsExpected(armedAt!!, 1_231_000L, AUTH_TAB_WINDOW_MILLIS),
-            "a callback thirty seconds after its own launch was refused, because the id was " +
-                "still carrying the reading of a sign-in from two hours before. The user is " +
-                "told the sign-in took too long, and every retry in that page repeats it.",
-        )
-    }
-
-    @Test
-    fun `a launch reports the ids it armed, and disarming takes back only those`() {
-        AuthTabWindow.arm(listOf("900001"), null, 100L)
-
-        val added = AuthTabWindow.arm(listOf("900002", "900003"), null, 200L)
-        assertEquals(listOf("900002", "900003"), added)
-
-        AuthTabWindow.disarm(added)
+    fun `only matching issued pairs in a multi-id address are activated`() {
+        issue()
+        issue("900002", other)
+        AuthTabWindow.arm(listOf("900001", "900002", "900003", "900001"), original, 100L)
+        assertEquals(100L, AuthTabWindow.armedAt("900001"))
         assertNull(AuthTabWindow.armedAt("900002"))
         assertNull(AuthTabWindow.armedAt("900003"))
-        assertEquals(
-            100L, AuthTabWindow.armedAt("900001"),
-            "a failed launch took back a request it had nothing to do with",
-        )
+        assertEquals(other, AuthTabWindow.nonceFor("900002"))
     }
 
     @Test
-    fun `every launch still held is reported, which is what the reload asks`() {
-        // The resume path asks whether ANY sign-in is still able to come back, and
-        // it can only ask that of the readings. An empty answer here would let the
-        // forced reload discard the page a callback was about to land in.
-        AuthTabWindow.arm(listOf("900001"), null, 100L)
-        AuthTabWindow.arm(listOf("900002"), null, 200L)
-
-        val readings = AuthTabWindow.armedReadings()
-
-        assertTrue(readings.contains(100L), "a launch is held but not reported: $readings")
-        assertTrue(readings.contains(200L), "a launch is held but not reported: $readings")
-    }
-
-    @Test
-    fun `a sign-in in flight survives an address naming a crowd of requests`() {
-        // The bound above is what makes this reachable: the record holds the most
-        // recent few launches, so anything able to record launches at will can
-        // push the sign-in the user has open in the browser out of it, and the
-        // callback then arrives for an id nothing recorded and is dropped in the
-        // log with nothing said. One address is enough, because a single one can
-        // name as many request ids as its author cares to type, and both arming
-        // sites read every id an address carries.
-        //
-        // The count is the record's own capacity: with the victim recorded first,
-        // that many further ids evict exactly it. Written so it holds whatever
-        // else this JVM has left in the record: an eviction takes the eldest, so
-        // ids arriving after the sign-in can only push out what arrived before
-        // it.
-        val crowd = (1..32).map { "9300$it" }
-        val address = crowd.joinToString("&") { "vscode-reqid=$it" }
-        try {
-            AuthTabWindow.arm(listOf("900001"), null, 1_000L)
-
-            AuthTabWindow.arm(authRequestIdsIn(address), null, 2_000L)
-
-            assertEquals(
-                1_000L, AuthTabWindow.armedAt("900001"),
-                "one address pushed the sign-in actually in flight out of the record. Its " +
-                    "callback comes back to an id nothing launched, is dropped without a " +
-                    "message, and the extension waits for ever on a value nothing will write.",
-            )
-        } finally {
-            AuthTabWindow.disarm(crowd)
+    fun `missing alternate and repeated nonces cannot refresh an active launch`() {
+        issue()
+        val first = AuthTabWindow.arm(listOf("900001"), original, 100L)
+        AuthTabWindow.launched(first)
+        for (nonce in listOf(null, other, original)) {
+            AuthTabWindow.arm(listOf("900001"), nonce, 200L)
+            assertEquals(100L, AuthTabWindow.armedAt("900001"))
+            assertEquals(original, AuthTabWindow.nonceFor("900001"))
         }
+        assertTrue(AuthTabWindow.armedReadings().contains(100L))
     }
 
     @Test
-    fun `the record does not grow for the life of the process`() {
-        // Entries outlive their own window on purpose, so that a late callback can
-        // be told apart from an invented one. Without a bound that is a leak in a
-        // process that stays alive for days.
-        val many = (1..200).map { "9100$it" }
-        try {
-            AuthTabWindow.arm(many, null, 500L)
-
-            assertNull(
-                AuthTabWindow.armedAt(many.first()),
-                "the oldest entry survived 200 launches; nothing is bounding this",
-            )
-            assertNotNull(
-                AuthTabWindow.armedAt(many.last()),
-                "the newest entry was evicted, which would refuse the sign-in just started",
-            )
-        } finally {
-            AuthTabWindow.disarm(many)
+    fun `a failed first launch reserves its secret for the original retry`() {
+        issue()
+        AuthTabWindow.disarm(AuthTabWindow.arm(listOf("900001"), original, 100L))
+        assertNull(AuthTabWindow.armedAt("900001"))
+        assertEquals(original, AuthTabWindow.nonceFor("900001"))
+        for (nonce in listOf(null, other)) {
+            assertTrue(AuthTabWindow.arm(listOf("900001"), nonce, 200L).isEmpty())
+            assertNull(AuthTabWindow.armedAt("900001"))
         }
+        val retry = AuthTabWindow.arm(listOf("900001"), original, 300L)
+        AuthTabWindow.launched(retry)
+        assertEquals(300L, AuthTabWindow.armedAt("900001"))
+    }
+
+    @Test
+    fun `an older failed attempt cannot roll back a later successful launch`() {
+        issue()
+        val older = AuthTabWindow.arm(listOf("900001"), original, 100L)
+        val later = AuthTabWindow.arm(listOf("900001"), original, 200L)
+        AuthTabWindow.launched(later)
+        AuthTabWindow.disarm(older)
+        AuthTabWindow.disarm(older)
+        assertEquals(100L, AuthTabWindow.armedAt("900001"))
+    }
+
+    @Test
+    fun `all overlapping attempts must fail before activation is rolled back`() {
+        issue()
+        val first = AuthTabWindow.arm(listOf("900001"), original, 100L)
+        val second = AuthTabWindow.arm(listOf("900001"), original, 200L)
+        AuthTabWindow.disarm(first)
+        assertEquals(100L, AuthTabWindow.armedAt("900001"))
+        AuthTabWindow.disarm(second)
+        assertNull(AuthTabWindow.armedAt("900001"))
+        assertEquals(original, AuthTabWindow.nonceFor("900001"))
+    }
+
+    @Test
+    fun `a replaced page rejects old arming rollback registration and returns`() {
+        issue()
+        val previous = AuthTabWindow.pageGeneration()
+        val first = AuthTabWindow.arm(listOf("900001"), original, 100L)
+        AuthTabWindow.beginPage()
+        assertTrue(issue(nonce = other))
+        val replacement = AuthTabWindow.arm(listOf("900001"), other, 200L)
+        AuthTabWindow.launched(replacement)
+        AuthTabWindow.disarm(first)
+        assertTrue(AuthTabWindow.arm(listOf("900001"), original, 300L, previous).isEmpty())
+        assertFalse(AuthTabWindow.register("900001", original, "d".repeat(32), previous))
+        assertEquals(200L, AuthTabWindow.armedAt("900001"))
+        assertFalse(callbackSecretMatches(original, AuthTabWindow.nonceFor("900001")))
+    }
+
+    @Test
+    fun `expiry reserves identity and cannot be reopened by a matching address`() {
+        issue()
+        AuthTabWindow.launched(AuthTabWindow.arm(listOf("900001"), original, 100L))
+        AuthTabWindow.expire("900001")
+        assertTrue(AuthTabWindow.arm(listOf("900001"), original, 200L).isEmpty())
+        assertTrue(issue())
+        assertNull(AuthTabWindow.armedAt("900001"))
+        assertTrue(AuthTabWindow.armedReadings().isEmpty())
+    }
+
+    @Test
+    fun `capacity refuses new issuance while preserving existing returns and reload restores it`() {
+        for (id in 1..32) assertTrue(issue(id.toString()))
+        AuthTabWindow.launched(AuthTabWindow.arm(listOf("1"), original, 100L))
+        assertFalse(issue("33"))
+        assertTrue(issue("1"))
+        assertEquals(100L, AuthTabWindow.armedAt("1"))
+        assertTrue(callbackSecretMatches(original, AuthTabWindow.nonceFor("1")))
+        AuthTabWindow.beginPage()
+        assertTrue(issue("33", other))
+        assertNull(AuthTabWindow.nonceFor("1"))
     }
 }
 
@@ -996,7 +958,7 @@ class AuthCallbackCallSiteTest {
 
         val gate = body.indexOfFirst { it.contains("authCallbackIsExpected(") }
         val relay = body.indexOfFirst { it.contains("handleExtensionCallback(") }
-        val taken = body.indexOfFirst { it.contains("AuthTabWindow.disarm(") }
+        val taken = body.indexOfFirst { it.contains("AuthTabWindow.expire(") }
 
         assertTrue(gate >= 0, "the timing gate is gone")
         assertTrue(relay >= 0, "the relay itself is gone")
