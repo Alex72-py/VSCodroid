@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Device-folder cleanup retains unrecorded workspace files, including names ending in `.vscodroid-partial`.
+
 - Device-folder imports preserve local edits made while the provider is being read.
 - Device-folder directory deletes preserve descendants added or changed on the device since the folder was opened.
 - Device-folder saves preserve both copies and report a failure when the upload recovery record cannot be written.

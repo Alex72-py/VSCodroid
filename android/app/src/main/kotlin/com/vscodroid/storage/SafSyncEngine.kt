@@ -2260,24 +2260,9 @@ class SafSyncEngine(private val context: Context) {
      * sends it down the not-a-plain-file branch, so a link out of the mirror can neither
      * be vouched for nor be walked through.
      *
-     * The one file vouched for without the record's word is a [PARTIAL_SUFFIX] name,
-     * which older builds used when streaming a document beside its destination before
-     * renaming it into place. A process death mid-copy left one behind, and
-     * nothing ever names it again once that document is renamed or deleted on the device:
-     * the record cannot carry it, [reconcileDeletions] only visits paths the record
-     * names, and every removal in `SafStorageManager` works on whole mirrors. So a single
-     * orphan used to answer false here for the life of the install, which meant the
-     * mirror could never be reclaimed and the user was told a half-written scratch file
-     * was work their device folder did not have. Its bytes are always a prefix of a
-     * device document, never anything only the mirror holds, so a mirror that is nothing
-     * but one is disposable.
-     *
-     * Vouched rather than deleted, and deliberately narrower than [isMachineTemporary].
-     * Deleting: this runs from a listing and from a launch pass, while the folder can be
-     * open and a copy can be streaming into exactly that name, and nothing here can tell
-     * a live scratch file from an abandoned one. Narrower: [isMachineTemporary] also
-     * covers `~` and `.tmp`, which belong to other writers, and one of those left in the
-     * mirror by a terminal is the user's own file that no sync ever put on the device.
+     * A temporary-looking workspace name does not establish provenance: a user can
+     * create it too, so every regular file must satisfy the same record check. Current
+     * inbound staging lives outside the workspace and has its own cleanup.
      */
     internal fun holdsOnlyVouchedCopies(mirrorDir: File): Boolean {
         val lines = readSyncedRecord(File(mirrorDir.path + SYNCED_RECORD_SUFFIX))
@@ -2291,7 +2276,6 @@ class SafSyncEngine(private val context: Context) {
             mirrorDir.walkTopDown().onFail { _, _ -> unreadable = true }.all { file ->
                 if (isLink(file)) false
                 else if (!file.isFile) true
-                else if (file.name.endsWith(PARTIAL_SUFFIX)) true
                 else identityLine(file.toRelativeString(mirrorDir), file) in vouched
             } && !unreadable
         } catch (e: Exception) {
