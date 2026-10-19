@@ -2077,9 +2077,7 @@ class SafSyncEngine(private val context: Context) {
         val tmp = File(record.parentFile, record.name + PARTIAL_SUFFIX)
         try {
             tmp.writeText(body)
-            // The same fallback [rewriteJournal] makes, and for the same reason: a
-            // rename the filesystem refuses would otherwise leave the record never
-            // written at all, which is worse than the write it was replacing.
+            // A refused rename would otherwise leave the synced set unwritten.
             if (!tmp.renameTo(record)) {
                 record.writeText(body)
                 tmp.delete()
@@ -2991,6 +2989,10 @@ class SafSyncEngine(private val context: Context) {
 
     /** The copy itself, with the document already claimed by the caller. */
     private fun writeLocalToSafHoldingDocument(localFile: File, safDocUri: Uri) {
+        val claim = markUploadInFlight(localFile.absolutePath) ?: run {
+            onWriteBackFailed(localFile)
+            return
+        }
         // What a hold was waiting to send goes out now, as the file stands, so the hold ends
         // here whatever this write comes to: one that fails is reported and kept in the
         // journal like any other. Nearly every write comes after [keepsDeviceEdit], which
@@ -3001,7 +3003,6 @@ class SafSyncEngine(private val context: Context) {
         // was read as, so the save after it went over another app's edit of that document
         // unguarded.
         heldBack.remove(localFile.absolutePath)
-        val claim = markUploadInFlight(localFile.absolutePath)
         // Released in a finally rather than at each exit, and this is not style.
         // The claim taken above was originally dropped at the one exit its author
         // had in mind, and the failure exits added later each returned without it,
@@ -3085,12 +3086,10 @@ class SafSyncEngine(private val context: Context) {
      * class has no screen and should not reach for one. The layer that owns a screen
      * decides how to say it.
      *
-     * Three callers reach this, and the mirror is protected on all three, by two gates
-     * rather than the one this comment used to name. The two exits inside
-     * [writeLocalToSaf] leave the file's journal entry in place, which
-     * `SafStorageManager.mayReclaim` reads. [refuseUnreadDocument] writes no journal
-     * entry at all, because it declines before the write begins; what covers it is the
-     * second gate, [holdsOnlyVouchedCopies], which refuses to reclaim a mirror holding
+     * A failed upload leaves its journal entry in place, which
+     * `SafStorageManager.mayReclaim` reads. A refusal before the write begins, either
+     * [refuseUnreadDocument] or an unavailable upload journal, has no new entry. What
+     * covers it is [holdsOnlyVouchedCopies], which refuses to reclaim a mirror holding
      * any file the `.synced` record cannot vouch for, and a file that was never written
      * back never is.
      *
@@ -3275,15 +3274,19 @@ class SafSyncEngine(private val context: Context) {
     private fun uploadJournal(): File = File(context.filesDir, UPLOADS_IN_FLIGHT_FILE)
 
     /**
-     * Takes this writer's claim on [absolutePath] and records that a write began.
+     * Records recovery intent before claiming [absolutePath], or returns null on failure.
      *
      * The claim is handed back rather than looked up again at the end, because the path
      * it names can move while the stream runs; see [UploadClaim].
      */
-    private fun markUploadInFlight(absolutePath: String): UploadClaim =
+    private fun markUploadInFlight(absolutePath: String): UploadClaim? =
         synchronized(uploadJournalLock) {
-            val claim = UploadClaim(absolutePath)
-            uploadClaims.add(claim)
+            if (!recordUploadIntent(absolutePath)) return@synchronized null
+            UploadClaim(absolutePath).also { uploadClaims.add(it) }
+        }
+
+    private fun recordUploadIntent(absolutePath: String): Boolean =
+        synchronized(uploadJournalLock) {
             try {
                 val journal = uploadJournal()
                 val lines = if (journal.isFile) journal.readLines() else emptyList()
@@ -3292,8 +3295,9 @@ class SafSyncEngine(private val context: Context) {
                 }
             } catch (e: Exception) {
                 Logger.w(tag, "Could not record the upload in flight: ${e.message}")
+                return@synchronized false
             }
-            claim
+            true
         }
 
     /**
@@ -3450,8 +3454,6 @@ class SafSyncEngine(private val context: Context) {
                 val journal = uploadJournal()
                 // A journal that is not there, and a rewrite with nothing to move, are
                 // both moves that succeeded: there is no line to disagree with the claim.
-                // A writer whose own record could not be written is exactly that case,
-                // and its claim still has to follow the file.
                 if (journal.isFile) {
                     val all = journal.readLines()
                     val moved =
@@ -3648,6 +3650,7 @@ class SafSyncEngine(private val context: Context) {
      * Caller must hold [uploadJournalLock]. The rename is the atomic half; a
      * truncate-and-write here would lose every bracket at once to a process death
      * in the middle, which is the one failure this file exists to remember across.
+     * This protects process interruption, without promising persistence after power loss.
      */
     private fun rewriteJournal(lines: List<String>) {
         val journal = uploadJournal()
@@ -3658,8 +3661,8 @@ class SafSyncEngine(private val context: Context) {
         val tmp = File(journal.parentFile, journal.name + PARTIAL_SUFFIX)
         tmp.writeText(lines.joinToString("\n"))
         if (!tmp.renameTo(journal)) {
-            journal.writeText(lines.joinToString("\n"))
             tmp.delete()
+            throw IOException("Could not replace the upload journal")
         }
     }
 
@@ -3715,7 +3718,9 @@ class SafSyncEngine(private val context: Context) {
      * why it is right.
      */
     private fun createOneInSaf(localFile: File, parentSafUri: Uri, treeUri: Uri, access: OutboundAccess? = null): Uri? {
+        var file = localFile
         return try {
+            if (isLink(localFile) || (!localFile.isDirectory && !localFile.isFile)) return null
             val parentDocId = DocumentsContract.getDocumentId(parentSafUri)
             val existingDocId = findChildDocId(treeUri, parentDocId, localFile.name)
             if (existingDocId == null && access != null) {
@@ -3726,6 +3731,11 @@ class SafSyncEngine(private val context: Context) {
             val docUri = if (existingDocId != null) {
                 DocumentsContract.buildDocumentUriUsingTree(treeUri, existingDocId)
             } else {
+                // A new empty document must already have recoverable local bytes.
+                if (localFile.isFile && !recordUploadIntent(localFile.absolutePath)) {
+                    announceLost(localFile)
+                    return null
+                }
                 val mimeType = if (localFile.isDirectory) {
                     DocumentsContract.Document.MIME_TYPE_DIR
                 } else {
@@ -3740,7 +3750,7 @@ class SafSyncEngine(private val context: Context) {
             // [mirrorNamedAsStored] holds the whole argument, including why the three
             // obvious repairs are each worse. Only for a document this call created: one
             // that was already there was found BY the mirror's name, so the two agree.
-            val file =
+            file =
                 if (existingDocId == null) mirrorNamedAsStored(docUri, localFile) else localFile
 
             if (file.isFile) {
@@ -3803,6 +3813,12 @@ class SafSyncEngine(private val context: Context) {
             // the platform provider builds that URI out of the user's own directory path.
             Logger.w(tag, "Failed to create ${localFile.name} in SAF: ${e.javaClass.simpleName}")
             null
+        } finally {
+            withCurrentMemory(access) {
+                for (candidate in setOf(localFile, file)) {
+                    if (!candidate.exists()) consumeStaleUploadRecord(candidate.absolutePath)
+                }
+            }
         }
     }
 
@@ -3895,7 +3911,10 @@ class SafSyncEngine(private val context: Context) {
         if (stored == null || stored == localFile.name) return localFile
 
         val renamed = if (isSafeSegment(stored)) File(localFile.parentFile, stored) else null
-        if (renamed == null || renamed.exists() || !localFile.renameTo(renamed)) {
+        if (renamed == null || renamed.exists() ||
+            !recordUploadIntent(renamed.absolutePath) || !localFile.renameTo(renamed)
+        ) {
+            if (renamed != null && !renamed.exists()) consumeStaleUploadRecord(renamed.absolutePath)
             Logger.w(
                 tag,
                 "The device folder stored ${localFile.name} as $stored and the mirror could " +
@@ -3903,6 +3922,7 @@ class SafSyncEngine(private val context: Context) {
             )
             return localFile
         }
+        consumeStaleUploadRecord(localFile.absolutePath)
         Logger.i(
             tag,
             "The device folder stored ${localFile.name} as $stored; the mirror copy now " +

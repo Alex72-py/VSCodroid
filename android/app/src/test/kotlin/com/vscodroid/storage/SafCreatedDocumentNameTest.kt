@@ -11,6 +11,7 @@ import io.mockk.just
 import io.mockk.mockk
 import io.mockk.mockkStatic
 import io.mockk.unmockkAll
+import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -42,6 +43,9 @@ class SafCreatedDocumentNameTest {
 
     @TempDir
     lateinit var workspace: File
+
+    @TempDir
+    lateinit var filesDir: File
 
     private lateinit var engine: SafSyncEngine
     private lateinit var resolver: ContentResolver
@@ -100,6 +104,7 @@ class SafCreatedDocumentNameTest {
 
         val context = mockk<Context>(relaxed = true)
         every { context.contentResolver } returns resolver
+        every { context.filesDir } returns filesDir
         engine = SafSyncEngine(context)
     }
 
@@ -241,11 +246,73 @@ class SafCreatedDocumentNameTest {
     fun `a provider that honours the name says nothing about it`() {
         create("notes.txt")
 
-        assertTrue(logged.isNotEmpty(), "nothing was logged at all, so this proves nothing")
+        assertEquals(listOf("notes.txt"), stored)
         assertTrue(
             logged.none { it.contains("stored notes.txt as") },
             "an ordinary create was reported as a rename: $logged",
         )
+    }
+
+    @Test
+    fun `an unavailable renamed recovery record keeps the original recoverable path`() {
+        val temporary = File(
+            filesDir, SafSyncEngine.UPLOADS_IN_FLIGHT_FILE + SafSyncEngine.PARTIAL_SUFFIX,
+        )
+        every { DocumentsContract.createDocument(any(), any(), any(), any()) } answers {
+            stored.add("a_b.txt")
+            assertTrue(temporary.mkdir())
+            File(temporary, "occupied").writeText("keep")
+            createdUri
+        }
+        val device = ByteArrayOutputStream()
+        every { resolver.openOutputStream(any(), "wt") } returns device
+        val failed = mutableListOf<File>()
+        engine.onWriteBackFailed = { failed.add(it) }
+
+        create("a:b.txt", "the only copy")
+
+        assertEquals("the only copy", device.toString())
+        assertEquals("the only copy", File(workspace, "a:b.txt").readText())
+        assertFalse(File(workspace, "a_b.txt").exists())
+        assertTrue(failed.isEmpty())
+        assertFalse(File(filesDir, SafSyncEngine.UPLOADS_IN_FLIGHT_FILE).exists())
+
+        assertTrue(temporary.deleteRecursively())
+        every { DocumentsContract.getTreeDocumentId(treeUri) } returns "root"
+        var row = -1
+        val cursor = mockk<Cursor>(relaxed = true) {
+            every { moveToNext() } answers { ++row == 0 }
+            every { getColumnIndexOrThrow(any()) } answers {
+                when (firstArg<String>()) {
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID -> 0
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME -> 1
+                    DocumentsContract.Document.COLUMN_MIME_TYPE -> 2
+                    else -> 3
+                }
+            }
+            every { getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED) } returns 4
+            every { isNull(any<Int>()) } returns false
+            every { getString(0) } returns "created-doc"
+            every { getString(1) } returns "a_b.txt"
+            every { getString(2) } returns "text/plain"
+            every { getLong(3) } returns "the only copy".toByteArray().size.toLong()
+            every { getLong(4) } returns 2_000_000_000_000L
+        }
+        every { resolver.query(childrenUri, any(), any(), any(), any()) } answers {
+            row = -1
+            cursor
+        }
+        every { resolver.openInputStream(any()) } answers {
+            java.io.ByteArrayInputStream(device.toByteArray())
+        }
+        try {
+            runBlocking { engine.initialSync(treeUri, workspace) { _, _ -> } }
+            assertEquals("the only copy", File(workspace, "a:b.txt").readText())
+            assertEquals("the only copy", File(workspace, "a_b.txt").readText())
+            assertEquals("the only copy", device.toString())
+        } finally {
+            File(workspace.path + SafSyncEngine.SYNCED_RECORD_SUFFIX).delete()
+        }
     }
 
     /**
