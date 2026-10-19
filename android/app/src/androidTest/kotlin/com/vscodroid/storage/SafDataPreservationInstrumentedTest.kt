@@ -5,6 +5,7 @@ import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.FileObserver
 import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.SystemClock
@@ -200,6 +201,99 @@ class SafDataPreservationInstrumentedTest {
         assertArrayEquals(intervening, preserved.single().readBytes())
         assertEquals("Reopening created another conflict copy", 2, mirror.listFiles()!!.size)
     }
+
+    @Test
+    fun directoryDeleteKeepsChildAddedAfterTheDeleteWasQueued() = runBlocking {
+        openDirectoryFixture()
+        val retained = AtomicInteger()
+        engine.onKeptOnDevice = { _, directory, _ -> if (directory) retained.incrementAndGet() }
+        queueDirectoryDelete()
+        control("directoryAdd", Bundle().apply { putByteArray("bytes", EDITED) })
+        assertFalse("The editor unexpectedly held the new child", File(mirror, SafDocumentsProvider.NEW_CHILD_ID).exists())
+
+        engine.runWriteBackLoop { false }
+
+        assertEquals("The provider received a destructive recursive delete", 0,
+            control("directoryStats").getInt("deleteCalls"))
+        assertTrue(control("directoryStats").getBoolean("exists"))
+        assertArrayEquals(EDITED, directoryBytes(newChild = true))
+        assertEquals("The retained directory was not reported", 1, retained.get())
+    }
+
+    @Test
+    fun directoryDeleteKeepsChangedChildWithoutItsOwnDeleteEvent() = runBlocking {
+        openDirectoryFixture()
+        queueDirectoryDelete()
+        control("directoryEdit", Bundle().apply { putByteArray("bytes", EDITED) })
+
+        engine.runWriteBackLoop { false }
+
+        assertEquals(0, control("directoryStats").getInt("deleteCalls"))
+        assertTrue(control("directoryStats").getBoolean("exists"))
+        assertArrayEquals(EDITED, directoryBytes())
+    }
+
+    @Test
+    fun directoryDeleteKeepsChildrenWhenTheirListingFails() = runBlocking {
+        openDirectoryFixture()
+        queueDirectoryDelete()
+        control("directoryFailListing")
+
+        engine.runWriteBackLoop { false }
+
+        assertEquals(0, control("directoryStats").getInt("deleteCalls"))
+        assertTrue(control("directoryStats").getBoolean("exists"))
+        assertArrayEquals(ORIGINAL, directoryBytes())
+    }
+
+    @Test
+    fun ordinaryDirectoryDeleteRemovesKnownChildrenFromProvider() = runBlocking {
+        openDirectoryFixture()
+        queueDirectoryDelete()
+
+        engine.runWriteBackLoop { false }
+
+        assertEquals("The control never sent its directory delete", 1,
+            control("directoryStats").getInt("deleteCalls"))
+        assertFalse(control("directoryStats").getBoolean("exists"))
+        assertFalse(control("directoryStats").getBoolean("knownExists"))
+    }
+
+    @Test
+    fun watcherDirectoryDeleteKeepsChildAddedOnlyOnProvider() = runBlocking {
+        openDirectoryFixture()
+        control("directoryAdd", Bundle().apply { putByteArray("bytes", EDITED) })
+        val retained = AtomicInteger()
+        engine.onKeptOnDevice = { _, directory, _ -> if (directory) retained.incrementAndGet() }
+        engine.startWatching(mirror, treeUri)
+
+        assertTrue(File(mirror, SafDocumentsProvider.DIRECTORY_ID).deleteRecursively())
+        assertTrue("The watcher produced neither a retention nor a directory delete", await {
+            retained.get() > 0 || !control("directoryStats").getBoolean("exists")
+        })
+        engine.stopWatching()
+
+        assertTrue("The provider-only child was removed", control("directoryStats").getBoolean("newExists"))
+        assertArrayEquals(EDITED, directoryBytes(newChild = true))
+        assertTrue("The directory retention was not reported", retained.get() > 0)
+    }
+
+    private suspend fun openDirectoryFixture() {
+        control("directoryReset", Bundle().apply { putByteArray("bytes", ORIGINAL) })
+        engine.initialSync(treeUri, mirror) { _, _ -> }
+        assertArrayEquals("The control did not read the known descendant", ORIGINAL,
+            File(mirror, SafDocumentsProvider.KNOWN_CHILD_ID).readBytes())
+    }
+
+    private fun queueDirectoryDelete() {
+        val directory = File(mirror, SafDocumentsProvider.DIRECTORY_ID)
+        assertTrue(directory.deleteRecursively())
+        engine.handleMirrorEvent(FileObserver.DELETE or 0x40000000, directory, mirror, treeUri)
+    }
+
+    private fun directoryBytes(newChild: Boolean = false): ByteArray = requireNotNull(
+        control("directoryRead", Bundle().apply { putBoolean("newChild", newChild) }).getByteArray("bytes"),
+    )
 
     private fun providerBytes(): ByteArray = requireNotNull(control("read").getByteArray("bytes"))
 

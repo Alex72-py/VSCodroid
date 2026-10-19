@@ -776,7 +776,7 @@ class SafDirectoryRenameTest {
         // easy over-correction: a folder the user removes in the editor would come
         // straight back the next time the folder is opened, because reopening copies
         // the device tree down again.
-        deviceFolderHolding("util")
+        deviceTree { parent -> if (parent == "root") listOf("util") else emptyList() }
 
         deliver(FileObserver.DELETE or isDirFlag, "util")
 
