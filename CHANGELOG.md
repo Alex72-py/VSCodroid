@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The Get Started walkthrough names C/C++ among the toolchains that install on demand.
+- The Settings editor fits a phone-width screen: its list is no longer 26% wider than the screen at 411 px, and the window it opens in no longer ends past the right edge.
 - The Accounts and Manage buttons stay reachable in the activity bar on a phone in landscape: views that do not fit move into the overflow menu.
 - Stopping the editor also ends its surviving server when the bootstrap has already exited.
 - Sign-in returns retain their original request identity until the editor page changes.
