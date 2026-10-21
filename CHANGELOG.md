@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The Get Started walkthrough has two more steps, after the theme: opening a folder from the phone's storage and running a file.
+- On Android, File > Open Folder, Ctrl+K Ctrl+O and the Explorer's Open Folder button ask whether the folder is on the device (Android's picker) or in the app's storage (the path dialog).
 
 ### Fixed
 
