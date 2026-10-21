@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A play button in the editor's title bar runs the open JavaScript, TypeScript, Ruby, Java, C, C++, `.sh` or `.bash` file in a terminal, as Python files already had.
 - Running a Ruby, Java, C or C++ file whose toolchain is not installed offers the toolchains screen.
+- A finger can drag the caret: touch it or just under it and drag sideways, and it follows, with the text scrolling at the editor's edge. A drag that starts up or down, or with text selected, scrolls as before.
 
 ### Changed
 
