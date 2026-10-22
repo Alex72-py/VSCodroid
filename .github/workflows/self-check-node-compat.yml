@@ -1,0 +1,100 @@
+name: Self-check Node compatibility
+
+on:
+  push:
+    branches:
+      - fix/self-check-node-version-message
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'scripts/test-auth-callback-provider.js'
+      - 'scripts/test-bridge-relay.js'
+      - '.github/workflows/self-check-node-compat.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-check-node-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-checks:
+    name: Node ${{ matrix.node-version }} compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['20.20.2', '24.22.1']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Confirm older Node gets the intended diagnostic
+        if: matrix.node-version == '20.20.2'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in scripts/test-auth-callback-provider.js scripts/test-bridge-relay.js; do
+            output_file="$(mktemp)"
+            if node "$script" >"$output_file" 2>&1; then
+              cat "$output_file"
+              echo "::error::$script unexpectedly succeeded on Node 20"
+              exit 1
+            fi
+            cat "$output_file"
+            if ! grep -Fq 'needs node:module.stripTypeScriptTypes' "$output_file"; then
+              echo "::error::$script did not print the expected compatibility diagnostic"
+              exit 1
+            fi
+            if ! grep -Fq 'this is v20.20.2' "$output_file"; then
+              echo "::error::$script did not report the actual Node version"
+              exit 1
+            fi
+            if grep -Fq 'TypeError: stripTypeScriptTypes is not a function' "$output_file"; then
+              echo "::error::$script regressed to the original unhelpful TypeError"
+              exit 1
+            fi
+            rm -f "$output_file"
+          done
+
+      - name: Run all JavaScript self-checks on Node 24
+        if: matrix.node-version == '24.22.1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in \
+            scripts/test-dns-proxy.js \
+            scripts/test-process-monitor.js \
+            scripts/test-platform-fix.js \
+            scripts/test-server-bootstrap.js \
+            scripts/test-process-monitor-extension.js \
+            scripts/test-bridge-relay.js \
+            scripts/test-auth-callback-provider.js \
+            scripts/test-ui-scale.js \
+            scripts/test-plain-text-page.js \
+            scripts/test-download-capture.js \
+            scripts/test-arrow-edge-guard.js \
+            scripts/test-modifier-release.js \
+            scripts/test-composing-enter.js \
+            scripts/test-leave-curtain.js \
+            scripts/test-keyboard-guard.js \
+            scripts/test-caret-drag.js \
+            scripts/test-serve-network.js \
+            scripts/test-welcome.js \
+            scripts/test-xdg-open.js; do
+            echo "::group::$script"
+            node "$script"
+            echo "::endgroup::"
+          done
