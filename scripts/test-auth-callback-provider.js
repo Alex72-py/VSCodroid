@@ -15,7 +15,7 @@ const { stripTypeScriptTypes } = require('node:module');
 if (typeof stripTypeScriptTypes !== 'function') {
     console.error(
         `${path.basename(__filename)}: needs node:module.stripTypeScriptTypes, `
-        + `which Node 22.13 or newer has (this is ${process.version}). CI runs Node 24.`,
+        + `which Node 22.13+ or 23.2+ has (this is ${process.version}). CI runs Node 24.`,
     );
     process.exit(1);
 }
