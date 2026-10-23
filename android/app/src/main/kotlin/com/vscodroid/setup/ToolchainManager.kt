@@ -326,17 +326,52 @@ class ToolchainManager(private val context: Context) {
         )
 
         /**
+         * Environment variables that hold a list of options the caller may already have
+         * set, which a toolchain adds to rather than replaces.
+         */
+        private val OPTION_LIST_VARS = setOf("RUBYOPT")
+
+        /** `-XX:Name=value`, `-XX:+Name`, `-XX:-Name`, and the heap and stack sizes. */
+        private val JVM_FLAG = Regex("-(?:XX:(?:[+-][A-Za-z0-9_]+|[A-Za-z0-9_]+=[A-Za-z0-9_.+-]+)|X(?:mx|ms|ss)[0-9]+[kKmMgG]?)")
+
+        /**
          * The JVM flags a toolchain manifest asks every JDK launcher to start with
-         * (`jvmFlags`), restricted to what a flag looks like. They are written into
-         * shell functions, so anything with a space, a quote or a metacharacter is
-         * dropped rather than trusted: the manifest is the app's own, but a line
-         * that breaks this file breaks every new terminal.
+         * (`jvmFlags`), restricted to the HotSpot option shapes in [JVM_FLAG]. They are
+         * written into shell functions, so anything with a space, a quote or a
+         * metacharacter is dropped rather than trusted: the manifest is the app's own,
+         * but a line that breaks this file breaks every new terminal. An agent, a
+         * system property or a class path option is not a tuning flag and is dropped
+         * with them: it would start in every JVM the user runs.
          */
         internal fun jvmFlagsOf(manifest: JSONObject): List<String> {
             val flags = manifest.optJSONArray("jvmFlags") ?: return emptyList()
             return (0 until flags.length())
                 .map { flags.optString(it, "") }
-                .filter { it.matches(Regex("-[A-Za-z0-9:=_.+-]+")) }
+                .filter { JVM_FLAG.matches(it) }
+        }
+
+        /**
+         * The VM options the manifest's `jvmFlags` put in front of a JDK launcher: as they
+         * are for `java`, as `-J` options for every tool beside it. Empty for anything that
+         * is not a launcher in the install root's `bin/`, and for a manifest without any (an
+         * install made while the pack carried JDK 17, which has no such flag).
+         */
+        internal fun jvmLauncherFlags(manifest: JSONObject, relPath: String): List<String> {
+            val root = manifest.optString("installRoot", "")
+            if (root.isEmpty() || !relPath.startsWith("$root/bin/")) return emptyList()
+            val direct = relPath.substringAfterLast('/') == "java"
+            return jvmFlagsOf(manifest).map { if (direct) it else "-J$it" }
+        }
+
+        /**
+         * Whether a manifest binary is a command at all. The JDK keeps `jspawnhelper` and
+         * `jexec` in `lib/`: the JVM starts the first by absolute path and the second is a
+         * `#!` target, so neither belongs on PATH, where each only showed up as a command
+         * that prints nothing useful when typed.
+         */
+        internal fun isPathCommand(manifest: JSONObject, relPath: String): Boolean {
+            val root = manifest.optString("installRoot", "")
+            return root.isEmpty() || !relPath.startsWith("$root/lib/")
         }
 
         /**
@@ -613,6 +648,25 @@ class ToolchainManager(private val context: Context) {
         return result.filter { it.isNotEmpty() }
     }
 
+    /**
+     * The name the record holds for an installed toolchain whose build is not the one the
+     * registry offers now, by pack name. Java 17 stays on a device that installed it
+     * before the pack moved to 21 (the record keeps its own manifest), and the card
+     * drawn from the registry called it "Java 21".
+     */
+    fun installedLabels(): Map<String, String> {
+        val state = readState()
+        val labels = mutableMapOf<String, String>()
+        for (i in 0 until state.length()) {
+            val entry = state.optJSONObject(i) ?: continue
+            val pack = "toolchain_${entry.optString("name")}"
+            val recorded = entry.optString("displayName")
+            val current = ToolchainRegistry.find(pack)?.displayName ?: continue
+            if (recorded.isNotEmpty() && recorded != current) labels[pack] = recorded
+        }
+        return labels
+    }
+
     // -- Install --
 
     fun install(packName: String) {
@@ -687,7 +741,13 @@ class ToolchainManager(private val context: Context) {
         //
         // Deletion stays off the caller's thread. releasePack also coordinates
         // with copies started by other managers and with Play's pending delete.
-        ioExecutor.execute { releasePack(info.packName) }
+        //
+        // Only on a Play install. A sideload has no delivered copy, and the removal it
+        // posted anyway is a Play Core call that can fail on every cancel, logging a
+        // pack that "stays on disk" when there is none.
+        if (!shouldUseHttpFallback()) {
+            ioExecutor.execute { releasePack(info.packName) }
+        }
         Logger.i(tag, "Cancelled download of ${info.packName}")
     }
 
@@ -1363,8 +1423,20 @@ class ToolchainManager(private val context: Context) {
      *   while the delivery is still there. The HTTP path ignores the answer, and
      *   correctly: its staging directory belongs to one download.
      */
-    private fun installFromDirectory(packName: String, assetsDir: File): Boolean {
-        if (!claimPack(packName)) {
+    private fun installFromDirectory(packName: String, assetsDir: File): Boolean =
+        installFromDirectory(packName, assetsDir, readsDeliveredPack = true)
+
+    /**
+     * [readsDeliveredPack] is false for the HTTP path, whose [assetsDir] is its own staging
+     * tree. Claimed as a reader of Play's copy it was refused for as long as a
+     * [releasePack] of that pack was in flight, over a directory it never opens.
+     */
+    private fun installFromDirectory(
+        packName: String,
+        assetsDir: File,
+        readsDeliveredPack: Boolean,
+    ): Boolean {
+        if (!claimPack(packName, readsDeliveredPack)) {
             Logger.i(tag, "Another install already holds $packName; leaving it to that one")
             // Neither COMPLETED nor FAILED, because both would be untrue in a way
             // something acts on. COMPLETED is the word this class uses for "the
@@ -1432,12 +1504,19 @@ class ToolchainManager(private val context: Context) {
      * A lookup by name rather than string surgery through the registry, because
      * an entry can outlive its registry row and because the record is what those
      * files were actually written from.
+     *
+     * Null unless the record's `displayName` is [displayName], the registry's name for
+     * the build about to be downloaded. A reinstall only overwrites the recorded tree
+     * when the root stays put, and the one pack that moved it, Java 17 to 21, kept
+     * the name `java`: the old 155 MB were credited against a tree that was written
+     * beside them. A record that names no build gets no credit either.
      */
-    private fun recordedInstallRoot(name: String): File? {
+    private fun recordedInstallRoot(name: String, displayName: String?): File? {
         val state = readState()
         for (i in 0 until state.length()) {
             val entry = state.optJSONObject(i) ?: continue
             if (entry.optString("name") != name) continue
+            if (displayName == null || entry.optString("displayName") != displayName) return null
             val root = entry.optString("installRoot", "")
             return if (root.isEmpty()) null else File(context.filesDir, root)
         }
@@ -1642,11 +1721,14 @@ class ToolchainManager(private val context: Context) {
         // across.
         flushWritesToMedia()
 
+        var replaced: JSONObject? = null
         synchronized(stateLock) {
             val state = readState()
             // Remove any existing entry for this toolchain
             for (i in state.length() - 1 downTo 0) {
-                if (state.optJSONObject(i)?.optString("name") == name) {
+                val entry = state.optJSONObject(i)
+                if (entry?.optString("name") == name) {
+                    replaced = entry
                     state.remove(i)
                 }
             }
@@ -1699,6 +1781,8 @@ class ToolchainManager(private val context: Context) {
             regenerateDerivedFilesLocked()
         }
 
+        removeSupersededTree(replaced, manifest)
+
         // The record now says everything the marker was standing in for, so this
         // is where it goes. Not in the caller's `finally`, which also ran for
         // calls that never wrote one and for the throw the marker exists to
@@ -1707,6 +1791,71 @@ class ToolchainManager(private val context: Context) {
         Logger.i(tag, "Toolchain $name installed successfully")
         report(packName, AssetPackStatus.COMPLETED, 100)
         return true
+    }
+
+    /**
+     * Deletes the install root of the record a reinstall just replaced, when the new
+     * manifest names a different one, and the `usr/bin` links that were left pointing
+     * into it.
+     *
+     * The record was the only thing that named the old tree, and the new record has
+     * replaced it: Java 17's `usr/lib/jvm/java-17-openjdk` stayed on disk, 155 MB
+     * that no Remove could reach, when the toolchain moved to
+     * `usr/lib/jvm/java-21-openjdk`. A same-root reinstall overwrote its own tree and
+     * is none of this function's business.
+     *
+     * Skipped when either root contains the other, or when the old one leaves
+     * `filesDir`, since the new tree would go with it. A link is removed only when it
+     * now dangles; one that points anywhere that still exists is not ours to judge.
+     */
+    private fun removeSupersededTree(replaced: JSONObject?, manifest: JSONObject) {
+        val oldRoot = replaced?.optString("installRoot", "").orEmpty()
+        if (oldRoot.isEmpty() || oldRoot == manifest.optString("installRoot", "")) return
+        val base = runCatching { context.filesDir.canonicalFile }.getOrNull() ?: return
+        val old = File(base, oldRoot).absoluteFile
+        val parent = old.parentFile ?: return
+        // Delete a root link itself, but never descend through a redirected ancestor.
+        if (runCatching { parent.canonicalFile }.getOrNull() != parent.normalize()) return
+        val resolvedOld = runCatching { old.canonicalFile }.getOrNull() ?: return
+        val new = runCatching {
+            File(context.filesDir, manifest.optString("installRoot", "")).canonicalFile
+        }.getOrNull() ?: return
+        if (!resolvedOld.path.startsWith(base.path + File.separator)) return
+        if (new.path == resolvedOld.path || new.path.startsWith(resolvedOld.path + File.separator) ||
+            resolvedOld.path.startsWith(new.path + File.separator)
+        ) return
+        StorageManager.deleteRecursive(old)
+        Logger.i(tag, "Deleted the superseded install root: $oldRoot")
+        val kept = manifest.optJSONObject("symlinks")
+        val links = replaced?.optJSONObject("symlinks") ?: return
+        for (linkName in links.keys()) {
+            if (kept?.has(linkName) == true) continue
+            val link = File(context.filesDir, "usr/bin/$linkName")
+            val dangling = try { Os.lstat(link.absolutePath); !link.exists() } catch (e: Exception) { false }
+            if (dangling) link.delete()
+        }
+    }
+
+    /**
+     * The options a JDK launcher's exec-table row carries, the table's counterpart of
+     * the shell function [regenerateEnvFileLocked] writes for it: the manifest's
+     * `jvmFlags`, and for `java`, `keytool` and `jshell` the home (and for `java` the
+     * temporary directory) that libjava would otherwise take from Termux's prefix.
+     *
+     * Without them a `make` recipe, a `process` task or a program's own `spawn("java")`
+     * got a JVM that warned on every start and could not create a temporary file.
+     * Values are expanded here, because the trampoline reads them as they are; the
+     * shell function takes the shell's own HOME and TMPDIR instead.
+     */
+    private fun jdkLauncherArgs(manifest: JSONObject, relPath: String, command: String): List<String> {
+        val args = jvmLauncherFlags(manifest, relPath).toMutableList()
+        val tmpDir = "${context.cacheDir.absolutePath}/tmp"
+        when (command) {
+            "java" -> args += listOf("-Duser.home=$homeDir", "-Djava.io.tmpdir=$tmpDir")
+            "keytool" -> args += "-J-Duser.home=$homeDir"
+            "jshell" -> args += listOf("-J-Djdk.lang.Process.launchMechanism=VFORK", "-J-Duser.home=$homeDir")
+        }
+        return args
     }
 
     /**
@@ -2018,18 +2167,18 @@ class ToolchainManager(private val context: Context) {
                 //
                 // The root comes from the RECORD, not from the incoming payload,
                 // which is not on disk yet, and that gap is the whole reason this
-                // path lacked the credit. The two differ only if a pack moves its
-                // `installRoot` between versions under an unchanged pack name, and
-                // no shipped pack does (`usr/lib/ruby`,
-                // `usr/lib/jvm/java-21-openjdk`). If one ever did, this gate
-                // understates by at most the measured old tree, which costs one
-                // download and a STORAGE refusal at the copy rather than a wrong
-                // install; the reclaim then takes the partial tree back, so the
-                // retry is no worse off.
+                // path lacked the credit. The two differ when a pack moves its
+                // `installRoot` between versions under an unchanged pack name, as
+                // Java did from 17 to 21, so the record only counts when it was
+                // written by the build now being downloaded
+                // ([recordedInstallRoot] compares `displayName`).
                 val stat = StatFs(context.filesDir.absolutePath)
                 val availableBytes = stat.availableBytes
                 val credit = existingTreeCredit(
-                    recordedInstallRoot(toolchainShortName(packName)),
+                    recordedInstallRoot(
+                        toolchainShortName(packName),
+                        ToolchainRegistry.find(packName)?.displayName,
+                    ),
                     context.filesDir,
                     unpackedBytes,
                     StorageManager::dirSize,
@@ -2175,7 +2324,7 @@ class ToolchainManager(private val context: Context) {
                 // deletes a staging directory this download owns alone, so it
                 // cannot reach whatever the install that holds the pack is
                 // reading.
-                installFromDirectory(packName, extractDir)
+                installFromDirectory(packName, extractDir, readsDeliveredPack = false)
 
             } catch (e: MissingFromRelease) {
                 // Ahead of the IOException it extends, because they are not the
@@ -2875,7 +3024,23 @@ class ToolchainManager(private val context: Context) {
                 // transformation and is not one.
                 val value = env.getString(key)
                     .replace("\$FILESDIR", "\$PREFIX/..")
-                sb.appendLine("export $key=\"$value\"")
+                if (!isShellSafeEnvEntry(key, value)) {
+                    Logger.w(tag, "No export for $name's ${redactToken(key)}: not a line that is " +
+                        "safe to put in a file every terminal sources")
+                    continue
+                }
+                if (key in OPTION_LIST_VARS) {
+                    // Added to what the parent passed, once. A plain export put
+                    // `-rrubygems` over the `-rbundler/setup` of a `bundle exec`, so
+                    // a bash started under it (BASH_ENV runs this file in every one)
+                    // lost the Gemfile's gems.
+                    sb.appendLine(
+                        "case \" \${$key-} \" in *\" $value \"*) ;; " +
+                            "*) export $key=\"\${$key:+\$$key }$value\" ;; esac"
+                    )
+                } else {
+                    sb.appendLine("export $key=\"$value\"")
+                }
             }
             sb.appendLine()
 
@@ -2903,20 +3068,15 @@ class ToolchainManager(private val context: Context) {
             }
             if (binaries != null) {
                 val lines = mutableListOf<String>()
-                val installRoot = tc.optString("installRoot", "")
-                val jvmFlags = jvmFlagsOf(tc)
                 for (i in 0 until binaries.length()) {
                     val relPath = binaries.getString(i)
                     val command = relPath.substringAfterLast('/')
-                    if (command.isEmpty() || command in scriptNames) continue
+                    if (command.isEmpty() || command in scriptNames || !isPathCommand(tc, relPath)) continue
                     // The JVM flags the manifest names reach every launcher in the JDK's
                     // bin/: `java` takes them as they are, every tool beside it takes
                     // them as -J options. A manifest without any (an install made while
                     // the pack carried JDK 17, which has no such flag) gets none.
-                    val jdkTool = jvmFlags.isNotEmpty() && installRoot.isNotEmpty() &&
-                        relPath.startsWith("$installRoot/bin/")
-                    val toolFlags = if (!jdkTool) "" else
-                        jvmFlags.joinToString(" ") { if (command == "java") it else "-J$it" } + " "
+                    val toolFlags = jvmLauncherFlags(tc, relPath).joinToString("") { "$it " }
                     // A name bash cannot use as a function is skipped rather than
                     // written. The manifests are regenerated from upstream packages
                     // at build time, so a future version can introduce a binary
@@ -3062,13 +3222,18 @@ class ToolchainManager(private val context: Context) {
             val pathDirs = tc.optJSONArray("pathDirs")
             if (pathDirs != null) {
                 for (j in 0 until pathDirs.length()) {
-                    extraPaths.add("\$PREFIX/../${pathDirs.getString(j)}")
+                    val dir = pathDirs.getString(j)
+                    if (!isShellSafePathDir(dir)) {
+                        Logger.w(tag, "No PATH entry for $name's ${redactToken(dir)}: not a directory " +
+                            "name that is safe to put in a file every terminal sources")
+                        continue
+                    }
+                    extraPaths.add("\$PREFIX/../$dir")
                 }
             }
         }
 
         if (extraPaths.isNotEmpty()) {
-            val paths = extraPaths.joinToString(":")
             sb.appendLine("# Toolchain PATH additions")
             // Appended, never prepended. These directories hold the raw payload:
             // `usr/bin/ruby` is the interpreter itself and the JDK's bin holds
@@ -3084,7 +3249,15 @@ class ToolchainManager(private val context: Context) {
             // They are kept rather than dropped as insurance for a future
             // manifest whose `binaries` list is incomplete: behind the
             // trampoline directory they cost nothing.
-            sb.appendLine("export PATH=\"\$PATH:$paths\"")
+            //
+            // Each directory is added once per PATH. Every bash this file reaches
+            // sources it again, and a plain `export PATH="$PATH:..."` made a bash
+            // started from a terminal's bash carry every directory twice.
+            sb.appendLine(
+                "for d in ${extraPaths.distinct().joinToString(" ") { "\"$it\"" }}; do " +
+                    "case \":\$PATH:\" in *\":\$d:\"*) ;; *) PATH=\"\$PATH:\$d\" ;; esac; done; " +
+                    "export PATH"
+            )
         }
 
         envFile.parentFile?.mkdirs()
@@ -3112,10 +3285,14 @@ class ToolchainManager(private val context: Context) {
      * own `exec()` for the same reason, bash invoked as `sh`, and a
      * `"type": "process"` task. This file is what those callers reach instead.
      *
-     * Two record shapes, matching the two the env file already emits:
+     * Two record shapes, matching the two the env file already emits, each with optional
+     * arguments the trampoline puts between the target and the caller's own:
      *
-     *   `<command>\t<absolute path of an ELF>`
+     *   `<command>\t<absolute path of an ELF>[\t<argument>...]`
      *   `<command>\t<absolute path of the interpreter>\t<absolute path of a script>`
+     *
+     * The arguments are what makes a JDK launcher start the way its shell function
+     * does, for the callers the function does not reach (see [jdkLauncherArgs]).
      *
      * and a third for the environment, with an empty command field:
      *
@@ -3188,7 +3365,9 @@ class ToolchainManager(private val context: Context) {
                 if (fields.size < 2) return@forEach
                 if (fields[0].isEmpty()) {
                     envRows[fields[1]] = line
-                } else if (fields.drop(1).all { it.startsWith("$filesDir/") && File(it).exists() }) {
+                } else if (fields.drop(1).filter { !it.startsWith("-") }
+                        .all { it.startsWith("$filesDir/") && File(it).exists() }
+                ) {
                     rows[fields[0]] = line
                 }
             }
@@ -3232,11 +3411,12 @@ class ToolchainManager(private val context: Context) {
                 for (j in 0 until binaries.length()) {
                     val relPath = binaries.getString(j)
                     val command = relPath.substringAfterLast('/')
-                    if (command.isEmpty() || command in scriptNames) continue
+                    if (command.isEmpty() || command in scriptNames || !isPathCommand(tc, relPath)) continue
                     if (!isElfFile(File(context.filesDir, relPath))) continue
                     val absolute = "$filesDir/$relPath"
                     elfPaths[command] = absolute
-                    rows[command] = "$command\t$absolute"
+                    rows[command] = (listOf(command, absolute) + jdkLauncherArgs(tc, relPath, command))
+                        .joinToString("\t")
                 }
             }
 
@@ -4909,6 +5089,27 @@ internal fun sha256Of(file: File): String {
     }
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
+
+/**
+ * Whether `export [key]="[value]"` is a line `toolchain-env.sh` can carry.
+ *
+ * A manifest comes from the pack the app ships or the release ZIP whose digest the same
+ * release publishes, so this is not a boundary against it: whoever can write a bad
+ * manifest can already ship a binary. It is what [isShellFunctionName] is, a bar that
+ * keeps one unusable entry from taking out the file every new terminal sources. `$FILESDIR`
+ * and `$HOME` stay possible, because the manifests mean them; a command substitution, a
+ * backtick, a double quote and a line break do not, and neither does a name that is not a
+ * variable's.
+ */
+internal fun isShellSafeEnvEntry(key: String, value: String): Boolean =
+    key.matches(Regex("[A-Za-z_][A-Za-z0-9_]*")) &&
+        value.none { it == '"' || it == '`' || it == '\\' || it == '\n' || it == '\r' } && "\$(" !in value
+
+/** Whether [dir], a manifest's `pathDirs` entry, can follow `$PREFIX/../` in the same file. */
+internal fun isShellSafePathDir(dir: String): Boolean =
+    dir.isNotEmpty() && !dir.startsWith("/") &&
+        dir.split('/').none { it == ".." || it.isEmpty() } &&
+        dir.none { it == '"' || it == '`' || it == '\\' || it == '\n' || it == '\r' || it == '$' }
 
 /**
  * Whether [relative] may name a path a toolchain owns, in a manifest's

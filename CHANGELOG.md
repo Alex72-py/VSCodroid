@@ -78,10 +78,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The server built from source includes the Copilot SDK's definitions and builtin-skills directories, which it lacked.
 - A Ruby script can `require` a gem it installed: the interpreter starts with RubyGems loaded. A Ruby installed earlier gets this at the next launch.
 - A gem with a native extension builds when the C/C++ toolchain is installed, because the Ruby toolchain now carries the headers it compiles against. A Ruby installed earlier needs removing and installing again to get them.
-- In a terminal, `java` and `keytool` start with the app's home and temporary directory instead of Termux's (`keytool` the home only), so a program that makes a temporary file no longer fails on a path that is not there. A Java installed earlier gets this at the next launch; a program an extension or a task starts by its full path does not.
 - The terminal no longer pins the command line over the first lines of its output: terminal sticky scroll is off by default, and can be turned on in Settings.
 - Builds retry the downloads from raw.githubusercontent.com when it answers with a rate limit.
 - A device folder whose provider lists two documents under one name leaves both alone: it copied the later over the earlier and, with a newer mirror copy, uploaded one document's bytes over the other's with no copy kept.
+- JDK commands started from terminals, extensions or build tools receive the app's directories and required JVM options.
+- Reinstalling Java removes its obsolete install root; existing Java 17 installs are labeled accurately.
+- Cancelling a sideloaded toolchain download no longer removes a Play pack; ZIP installs remain available while Play removes its copy.
+- Toolchain downloads check peak disk usage without counting an older install as reclaimable space.
+- Java toolchains omit commands unsupported on Android.
+- Uninstalling Java or Ruby removes their bundled notices.
+- Nested bash sessions preserve Bundler options and avoid duplicate toolchain PATH entries.
+- C/C++ programs resolve temporary files, home and shell through app paths.
+- Sign-in attempts that never launch no longer occupy a request slot indefinitely.
+- Sign-in failures distinguish an editor that is not ready from a request that was never issued.
+- Release builds reject ambiguous version declarations.
 
 ## [1.5.0] - 2026-10-14
 

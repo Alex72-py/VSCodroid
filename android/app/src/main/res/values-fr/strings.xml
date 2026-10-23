@@ -103,6 +103,8 @@
          type is quoted because the audience is developers and it is the part
          worth putting in a bug report. -->
     <string name="url_handoff_failed">Impossible d\'ouvrir ce lien %1$s (%2$s).</string>
+    <string name="sign_in_not_ready">L\'éditeur n\'est pas prêt pour cette connexion. Rechargez l\'éditeur et réessayez.</string>
+    <string name="sign_in_not_issued">L\'éditeur n\'a pas lancé cette connexion. Réessayez.</string>
 
     <!-- A page inside the editor asked for an https address the WebView would not
          load: a dev server previewed in the Simple Browser, an image in a preview,
@@ -207,6 +209,7 @@
     <string name="toolchain_cancel">Annuler</string>
     <string name="toolchain_remove_confirm_title">Supprimer %s ?</string>
     <string name="toolchain_remove_confirm_message">Tous les fichiers %s seront supprimés. Vous pourrez la réinstaller à tout moment.</string>
+    <string name="toolchain_older_build">%1$s est installé. Supprimez-le puis installez-le à nouveau pour obtenir %2$s.</string>
 
     <!-- Launcher shortcut: in practice the only route to the toolchain screen.
          The activity is not exported and has no launcher entry, and the one

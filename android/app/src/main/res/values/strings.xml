@@ -103,6 +103,8 @@
          type is quoted because the audience is developers and it is the part
          worth putting in a bug report. -->
     <string name="url_handoff_failed">Could not open that %1$s link (%2$s).</string>
+    <string name="sign_in_not_ready">The editor is not ready for that sign-in. Reload the editor and try again.</string>
+    <string name="sign_in_not_issued">The editor did not start that sign-in. Try signing in again.</string>
 
     <!-- A page inside the editor asked for an https address the WebView would not
          load: a dev server previewed in the Simple Browser, an image in a preview,
@@ -207,6 +209,7 @@
     <string name="toolchain_cancel">Cancel</string>
     <string name="toolchain_remove_confirm_title">Remove %s?</string>
     <string name="toolchain_remove_confirm_message">This will delete all %s files. You can reinstall anytime.</string>
+    <string name="toolchain_older_build">%1$s is installed. Remove it and install again to get %2$s.</string>
 
     <!-- Launcher shortcut: one of two routes to the toolchain screen, and the
          only one that works while the editor is not up. The activity is not
