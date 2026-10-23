@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Settings and notification popups fit short windows and use the space left by hidden title and status bars.
+- Resizing or moving a panel in a short window preserves its height across position changes and reloads.
+- Toggling the status bar while it is temporarily hidden keeps the chosen visibility when the window grows.
 - Moving the editor to a display with a different density preserves its session and rebuilds the key row at the new scale.
 - The Get Started walkthrough names C/C++ among the toolchains that install on demand.
 - The Settings editor fits a phone-width screen: its list no longer runs 131 px past the right edge at 411 px, and the window it opens in no longer ends past it either.
