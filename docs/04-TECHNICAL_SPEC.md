@@ -1435,7 +1435,7 @@ is intact, not that it is the right tarball.
 ### 7.1 Toolchain Configuration
 
 Toolchains are declared in Kotlin, in `ToolchainRegistry.available`, and both the first-run picker
-and the manage screen are built from that list. Three are shipped, Ruby, Java 17 and C/C++:
+and the manage screen are built from that list. Three are shipped, Ruby, Java 21 and C/C++:
 
 ```kotlin
 ToolchainInfo(
@@ -1443,13 +1443,13 @@ ToolchainInfo(
     displayName = "Ruby",
     shortLabel = "Ruby",
     descriptionRes = R.string.toolchain_ruby_description,   // "Ruby with irb, gem, bundler"
-    estimatedSize = 39_000_000,   // unpacked, what the free-space gate uses; 37.6 MB measured
-    downloadSize = 10_500_000,    // the ZIP, what the picker quotes to the user
+    estimatedSize = 41_000_000,   // unpacked, what the free-space gate uses; 39.7 MB measured
+    downloadSize = 11_000_000,    // the ZIP, what the picker quotes to the user
     downloadUrl = "https://github.com/rmyndharis/VSCodroid/releases/latest/download/toolchain_ruby.zip",
 )
 ```
 
-The second entry is `toolchain_java`, OpenJDK 17 with `javac`, `jar` and `jshell`. The third is
+The second entry is `toolchain_java`, OpenJDK 21 with `javac`, `jar` and `jshell`. The third is
 `toolchain_cpp`, clang and lld with a minimal sysroot (section 7.5).
 
 The first two are an interpreter and a JVM, and for a long time that was a constraint rather than a

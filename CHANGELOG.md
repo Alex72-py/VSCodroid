@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Get Started walkthrough has two more steps, after the theme: opening a folder from the phone's storage and running a file.
 - On Android, File > Open Folder, Ctrl+K Ctrl+O and the Explorer's Open Folder button ask whether the folder is on the device (Android's picker) or in the app's storage (the path dialog).
+- The Java toolchain is OpenJDK 21 instead of 17: 64 MB to download and 186 MB installed, up from 56.5 and 160. A Java 17 installed earlier keeps working until it is removed and installed again.
 
 ### Fixed
 
@@ -25,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The Accounts and Manage buttons stay reachable in the activity bar on a phone in landscape: views that do not fit move into the overflow menu.
 - On a phone in landscape with the keyboard up, the title bar and the status bar are put away so the editor shows four lines of code instead of one; they come back when the keyboard goes down.
 - On a phone in landscape, an open terminal panel is put away when the keyboard comes up unless the panel has the focus, so the editor keeps its four lines; it comes back at its size when the keyboard goes down.
+- On a phone in landscape with the keyboard up, Ctrl+J and Ctrl+backtick show a panel that was put away instead of closing it unseen, and a panel shown or focused in that window is back at its height when the keyboard goes down instead of at its minimum.
 - The Python extension is allowed the editor APIs it declares, so it finishes activating instead of failing at its first test API.
 - The process count warning appears from 10 processes instead of 6, so one open file and a terminal no longer raise it.
 - The process count warning no longer calls the idle count a target.
@@ -70,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Building from source no longer stops at a dangling Termux link in pip's CA bundle.
 - Building the server from source compiles the Copilot extension once more when the first run leaves its SDK entry missing, instead of failing at packaging.
 - The server built from source includes the Copilot SDK's definitions and builtin-skills directories, which it lacked.
+- A Ruby script can `require` a gem it installed: the interpreter starts with RubyGems loaded. A Ruby installed earlier gets this at the next launch.
+- A gem with a native extension builds when the C/C++ toolchain is installed, because the Ruby toolchain now carries the headers it compiles against. A Ruby installed earlier needs removing and installing again to get them.
+- In a terminal, `java` and `keytool` start with the app's home and temporary directory instead of Termux's (`keytool` the home only), so a program that makes a temporary file no longer fails on a path that is not there. A Java installed earlier gets this at the next launch; a program an extension or a task starts by its full path does not.
+- The terminal no longer pins the command line over the first lines of its output: terminal sticky scroll is off by default, and can be turned on in Settings.
+- Builds retry the downloads from raw.githubusercontent.com when it answers with a rate limit.
+- A device folder whose provider lists two documents under one name leaves both alone: it copied the later over the earlier and, with a newer mirror copy, uploaded one document's bytes over the other's with no copy kept.
 
 ## [1.5.0] - 2026-10-14
 

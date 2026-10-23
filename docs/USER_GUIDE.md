@@ -24,7 +24,7 @@ A practical guide to using VSCodroid -- the full VS Code IDE running natively on
 
 ### What Happens on First Open
 
-1. **Install**. Download from the [Play Store](#) or [GitHub Releases](https://github.com/rmyndharis/VSCodroid/releases). The core download is roughly 270 MB, and you need about 738 MB free for the extraction that follows.
+1. **Install**. Download from the [Play Store](https://play.google.com/store/apps/details?id=com.vscodroid) or [GitHub Releases](https://github.com/rmyndharis/VSCodroid/releases). The core download is roughly 270 MB, and you need about 738 MB free for the extraction that follows.
 2. **Binary extraction** -- On first launch, VSCodroid extracts bundled tools (Node.js, Python, Git, Bash, and others) to internal storage. About 603 MB lands on disk, unpacked one file at a time behind a progress bar, so allow minutes rather than seconds on a slower device. The ~738 MB above is that payload plus the working room setup insists on before it will start. It happens on the first launch and again after every app update, because the extraction is keyed on the app version rather than on what is already unpacked. An update needs far less free space than a fresh install (the app credits what it already holds, so roughly 230 MB rather than 738 MB), but it does re-copy the files and it does take minutes. A first run that is interrupted and retried on the same version is the one case that does not start over: files already the right size are left alone.
 3. **Language Picker** -- A prompt asks "What do you code in?" with options for Ruby, Java and C/C++. It comes back at each launch until you answer it with Continue or Skip, and your answer is not final: touch and hold the app icon and pick **Manage toolchains** to add or remove them later. Whatever you select downloads there on the setup screen, one at a time; a download that fails is skipped and the rest continue. Skip goes straight to the editor.
 4. **Ready** -- The VS Code editor loads with terminal, file explorer, and all bundled tools available immediately.
@@ -870,13 +870,38 @@ Beyond the bundled tools (Node.js, Python, Git, Bash), VSCodroid offers addition
 
 | Language | Download Size | Installed Size | Includes |
 |----------|--------------|----------------|----------|
-| Ruby 4.0 | 10.5 MB | 39 MB | ruby, gem, irb, bundler, rake |
-| Java 17 (OpenJDK) | 56.5 MB | 160 MB | java, javac, jar, jshell |
+| Ruby 4.0 | 11 MB | 41 MB | ruby, gem, irb, bundler, rake, and the headers native gems build against |
+| Java 21 (OpenJDK) | 64 MB | 186 MB | java, javac, jar, jshell |
 | C/C++ (clang 21) | 74 MB | 260 MB | cc, c++, gcc, g++, clang, clang++, ld, ar, ranlib, nm, strip, objdump, objcopy, readelf, size, and the C and C++ headers |
 
 The C/C++ toolchain is the largest. Installing a toolchain holds the unpacked copy and the
 installed copy at once, so the install asks for roughly twice the installed size free while
 it runs, which for this one is about 570 MB.
+
+### What You Get For Each Language
+
+Every language gets syntax highlighting, the title bar's play button and a terminal. What sits
+beyond that differs a great deal, and this is the whole of it, so you can pick what you need:
+
+| Language | Run button | Completion and error squiggles | Debugger | Packages |
+|----------|------------|--------------------------------|----------|----------|
+| JavaScript and TypeScript (bundled) | `node file` | Yes, the editor's own | js-debug | npm; see the TypeScript note below |
+| Python (bundled) | Yes | Completion and hover from Jedi; no type checking | None | pip, including wheels built for Android (numpy installs and runs) |
+| Ruby | `ruby file` | None | None | gem and bundler; a gem with a compiled part needs the C/C++ toolchain as well (puma and nio4r build) |
+| Java 21 | `java file` (a single source file) | None | None | None: no Maven or Gradle |
+| C and C++ | Compiles to a temporary file and runs it | None | None | None: no CMake or Ninja; `make` works |
+
+**Java and C/C++ here are for compiling and running programs, not an IDE.** The Language
+Support for Java extension from Open VSX installs but cannot run: it starts its server by the
+JDK's full path, which Android refuses to execute, and the server it would start needs about 650
+MB of memory on a phone. Nothing in VSCodroid works around that, so do not expect error squiggles
+or completion for Java. The same goes for C and C++, where `clangd` is not included.
+
+**TypeScript.** `npm install typescript` now installs version 7, whose compiler is a native
+program with no Android build, so `npx tsc` stops with `Unable to resolve ... Either your
+platform is unsupported`. Install `typescript@6` instead, which compiles in JavaScript and works
+here. The editor's own TypeScript checking is separate and is not affected. Node itself runs
+`.ts` files directly (`node file.ts`) as long as they use only syntax that can be stripped.
 
 ### Installing During First Run
 
@@ -974,6 +999,8 @@ need libraries that are not here.
 and Ninja; OpenMP (`-fopenmp`); the sanitizers (`-fsanitize=`); a debugger; and `<spawn.h>`, so a
 program that calls `posix_spawn` does not compile. Programs are built for the phone, as arm64
 Android programs, and for nothing else.
+
+Two C library calls still name Termux's directories, because the headers were built for it: `tmpfile()` returns NULL and `getpwuid()` reports a home directory that does not exist here. Use `mkstemp` on a name under `getenv("TMPDIR")` and `getenv("HOME")` instead.
 
 `make -j4` starts four compilers at once, each a process Android counts against its phantom
 process limit (see [Android Phantom Process Limit](#android-phantom-process-limit)); `make -j2` is
@@ -1431,7 +1458,7 @@ VS Code's web client runs as a single window. You cannot open multiple VS Code w
 
 ### Storage
 
-Core installation extracts approximately 603 MB to internal storage. With Ruby and Java installed, expect around 800 MB, and about 1,060 MB with C/C++ as well. Setup needs about 738 MB free before it starts, which is more than it ends up occupying because extraction needs room to work. If it refuses, it asks for the shortfall it measured rather than the whole figure, so a device part of the way through is asked only for what is missing. Beyond it, keep a few hundred MB free for node_modules, build artifacts and caches.
+Core installation extracts approximately 603 MB to internal storage. With Ruby and Java installed, expect around 830 MB, and about 1,090 MB with C/C++ as well. Setup needs about 738 MB free before it starts, which is more than it ends up occupying because extraction needs room to work. If it refuses, it asks for the shortfall it measured rather than the whole figure, so a device part of the way through is asked only for what is missing. Beyond it, keep a few hundred MB free for node_modules, build artifacts and caches.
 
 ---
 
