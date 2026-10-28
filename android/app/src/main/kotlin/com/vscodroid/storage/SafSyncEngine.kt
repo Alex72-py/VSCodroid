@@ -35,6 +35,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.LockSupport
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 
@@ -1166,6 +1167,7 @@ class SafSyncEngine(private val context: Context) {
             mirrorDir, documents, enumerationComplete,
             recorded.map { recordLine(it, digests[it] ?: previousRecord?.get(it)) },
         )
+        val clearedPartials = removeRedundantPartials(mirrorDir, documents)
 
         val elapsed = System.currentTimeMillis() - startTime
         Logger.i(
@@ -1173,7 +1175,7 @@ class SafSyncEngine(private val context: Context) {
             "Initial sync complete: $filesDone files ($skippedLarge too large, " +
                 "$failedCopies could not be copied, $keptLocal kept, " +
                 "$uploadsDone written back, $setAside set aside, $putBack put back, " +
-                "${recorded.size} vouched for, $removed removed) in ${elapsed}ms"
+                "${recorded.size} vouched for, $removed removed, $clearedPartials partial copies cleared) in ${elapsed}ms"
         )
 
         // Only the copies that were attempted and failed. A document skipped for size is
@@ -1192,6 +1194,68 @@ class SafSyncEngine(private val context: Context) {
             onDocumentsNotCopied(failedCopies, outOfRoom || belowFloor)
         }
         if ("" !in skippedDirs) unfetched.remove(mirrorDir.absolutePath)
+    }
+
+    /**
+     * Removes a `<name>.vscodroid-partial` entry beside a document when every byte it holds is
+     * the start of that document's copy in the mirror.
+     *
+     * Builds up to 1.5.0 streamed a device document into that name before renaming it into place,
+     * and a copy cut short left it behind for good. This build neither writes that name nor
+     * writes such an entry back, so it only sat in the Explorer. A name alone does not make an
+     * entry ours: a workspace file can end the same way. So the test is the content. An entry
+     * that is the start of the file beside it adds nothing to that file, so dropping it loses
+     * nothing whoever made it; anything else, including a link, a directory, an entry longer
+     * than its neighbour or one with no neighbour, is kept.
+     *
+     * It runs after the copies of this open are in place, so the entry of a document that was
+     * not yet in the mirror is compared with the copy fetched a moment ago. Almost no document
+     * has one, so the common cost is one stat per document.
+     */
+    private fun removeRedundantPartials(mirrorDir: File, documents: List<DocumentInfo>): Int {
+        var removed = 0
+        for (document in documents) {
+            if (document.isDirectory) continue
+            val relative = document.relativePath
+            if (!File(mirrorDir, relative + PARTIAL_SUFFIX).exists()) continue
+            try {
+                openOutboundPath(File(mirrorDir, relative), mirrorDir).use { path ->
+                    val partial = path.sibling(path.leaf.toString() + PARTIAL_SUFFIX)
+                    val before = path.attributes(partial)
+                    if (isStartOfSibling(path, partial, path.leaf, before)) {
+                        // A last look: what was compared must still be what is removed.
+                        if (!sameInboundAttributes(before, path.attributes(partial))) return@use
+                        path.parent.deleteFile(partial)
+                        removed++
+                    }
+                }
+            } catch (e: Exception) {
+                Logger.w(tag, "Kept a partial copy beside $relative: ${e.message}")
+            }
+        }
+        return removed
+    }
+
+    private fun isStartOfSibling(
+        dest: OutboundPath, partial: Path, whole: Path, partialAttributes: BasicFileAttributes,
+    ): Boolean {
+        val wholeAttributes = dest.attributes(whole)
+        if (!partialAttributes.isRegularFile || !wholeAttributes.isRegularFile ||
+            partialAttributes.size() > wholeAttributes.size()) return false
+        return dest.input(partial).use { start ->
+            dest.input(whole).use { all ->
+                val one = ByteArray(COPY_BUFFER_SIZE)
+                val two = ByteArray(COPY_BUFFER_SIZE)
+                var left = partialAttributes.size()
+                while (left > 0) {
+                    val want = minOf(left, one.size.toLong()).toInt()
+                    if (readFully(start, one, want) != want || readFully(all, two, want) != want) return false
+                    if (!java.util.Arrays.equals(one, 0, want, two, 0, want)) return false
+                    left -= want
+                }
+                true
+            }
+        }
     }
 
     /**
@@ -2187,15 +2251,40 @@ class SafSyncEngine(private val context: Context) {
             emptyList()
         }
 
+        val carried = ArrayList<String>()
         for (line in entries) {
             val path = unescapeRecordPath(line.substringBefore('\t'))
 
             if (path.isEmpty() || path in present) continue
             if (removeRecordedCopy(mirrorDir, path, line)) removed++
+            else if (isUnprovenCopyOfRecord(mirrorDir, path, line)) carried += line
         }
 
-        writeSyncedRecord(record, recorded)
+        writeSyncedRecord(record, recorded + carried)
         return removed
+    }
+
+    /**
+     * A row with no digest, written before digests existed or past the budget that reads them, cannot
+     * prove the mirror copy is the device's old bytes, so [removeRecordedCopy] keeps the copy. The row has
+     * to stay with it: without one the copy reads as new local work, and the next open sends a document the
+     * device deleted back to it. A copy that no longer matches its row is work of the user's and is let go.
+     */
+    private fun isUnprovenCopyOfRecord(mirrorDir: File, relativePath: String, line: String): Boolean {
+        val (whole, digest) = splitRecordLine(line)
+        if (digest != null) return false
+        // A fourth field this build cannot read leaves the identity in the first three.
+        val identity = line.split('\t').let { if (it.size == 4) it.take(3).joinToString("\t") else whole }
+        return try {
+            openOutboundPath(File(mirrorDir, relativePath), mirrorDir).use { selected ->
+                val attributes = selected.attributes()
+                attributes.isRegularFile && identity == identityLine(
+                    relativePath, attributes.lastModifiedTime().toMillis(), attributes.size(),
+                )
+            }
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun removeRecordedCopy(mirrorDir: File, relativePath: String, line: String): Boolean {
@@ -2545,15 +2634,17 @@ class SafSyncEngine(private val context: Context) {
                 if (job != null) {
                     processWriteBack(session, job)
                 } else if (!retryHeldBack(session)) {
-                    Thread.sleep(WRITEBACK_POLL_MS)
+                    // Parked, not slept: a stop wakes it with unpark. An interrupt lands in whatever the
+                    // thread is doing, and in the middle of a save the next read of the local file fails
+                    // on it, leaving the device document cut short.
+                    LockSupport.parkNanos(WRITEBACK_POLL_MS * 1_000_000L)
                 }
             }
         } catch (_: InterruptedException) {
-            // stopWatching() interrupts to wake this thread out of the sleep it spends
-            // nearly all of its idle time in, so this is the ordinary way the loop ends,
-            // not a fault. Letting it escape reaches the thread's uncaught handler, and
-            // Android's default handler ends the process: closing a folder, which
-            // happens on every folder switch and on destroy, would close the app.
+            // An interrupt from outside, which wakes a sleeping thread and ends the loop
+            // the way a stop does, is not a fault. Letting it escape reaches the thread's
+            // uncaught handler, and Android's default handler ends the process: closing a
+            // folder, which happens on every folder switch and on destroy, would close the app.
             interrupted = true
         }
         // Whichever way the loop ended, the queue can still hold writes the user is
@@ -2593,11 +2684,12 @@ class SafSyncEngine(private val context: Context) {
             session = WatchSession().apply { abandoned = true }
             closing.running = false
 
-            // Wake the thread out of its sleep, then wait for it to drain remaining writes.
+            // Wake the thread out of its wait, then wait for it to drain remaining writes.
             // An idle queue drains in microseconds, so this costs only what there is to lose.
+            // Not interrupted: a save in flight would fail its next read of the local file.
             val worker = closing.worker
             closing.worker = null
-            worker?.interrupt()
+            worker?.let { LockSupport.unpark(it) }
             try { worker?.join(DRAIN_GRACE_MS) } catch (_: InterruptedException) {}
 
             if (worker != null && worker.isAlive) {
@@ -6994,8 +7086,8 @@ private class OutboundAccess(
      * a provider call that never returns costs the waiting save its place and a notice
      * rather than a thread for good.
      *
-     * An interrupt, which is how a stop wakes a worker, does not cut the wait short: the
-     * job has been taken off its queue and a thrown wait would lose it. It is set aside
+     * An interrupt does not cut the wait short: the job has been taken off its queue and a
+     * thrown wait would lose it. It is set aside
      * for the action, which must not meet it (a stream copy fails on a thread carrying
      * one), and handed back after.
      */
