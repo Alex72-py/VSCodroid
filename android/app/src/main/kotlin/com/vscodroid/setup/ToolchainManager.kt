@@ -612,7 +612,11 @@ class ToolchainManager(private val context: Context) {
     }
 
     fun unregisterListenerIfIdle() {
-        if (synchronized(this) { playRequests.isEmpty() }) unregisterListener()
+        // Decided and wished in one step, under the monitor that guards the requests: an install
+        // that adds one in between would otherwise have its listener taken away, and its pack
+        // would download with nobody told.
+        val idle = synchronized(this) { playRequests.isEmpty().also { if (it) listenerWanted = false } }
+        if (idle) applyListener()
     }
 
     /**
@@ -756,10 +760,11 @@ class ToolchainManager(private val context: Context) {
         } else {
             val request = synchronized(this) {
                 if (info.packName in playRequests) return
+                listenerWanted = true
                 Any().also { playRequests[info.packName] = it }
             }
             try {
-                registerListener()
+                applyListener()
             } catch (e: Throwable) {
                 synchronized(this) { playRequests.remove(info.packName) }
                 throw e
@@ -3343,9 +3348,9 @@ class ToolchainManager(private val context: Context) {
             // sources it again, and a plain `export PATH="$PATH:..."` made a bash
             // started from a terminal's bash carry every directory twice.
             sb.appendLine(
-                "for d in ${extraPaths.distinct().joinToString(" ") { "\"$it\"" }}; do " +
-                    "case \":\$PATH:\" in *\":\$d:\"*) ;; *) PATH=\"\$PATH:\$d\" ;; esac; done; " +
-                    "export PATH; unset d"
+                "for __vscodroid_d in ${extraPaths.distinct().joinToString(" ") { "\"$it\"" }}; do " +
+                    "case \":\$PATH:\" in *\":\$__vscodroid_d:\"*) ;; *) PATH=\"\$PATH:\$__vscodroid_d\" ;; esac; done; " +
+                    "export PATH; unset __vscodroid_d"
             )
         }
 
