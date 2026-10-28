@@ -460,9 +460,84 @@ function panelRoundTrip() {
   remembered.values.PANEL_LAST_NON_MAXIMIZED_HEIGHT = 90;
   remembered.layout.setPanelPosition('top');
   assert.equal(remembered.layout.panelHeightBeforeShort, 176, 'a short move must keep an earlier unsqueezed height');
+  // A panel closed while the window was short keeps the height it had before, through a second short episode.
+  const closed = create('after');
+  closed.layout.focused = true;
+  closed.resize(191);
+  assert.equal(closed.grid.height, 113, 'a focused panel stays in the short window, squeezed');
+  closed.layout.setPanelHidden(true);
+  closed.resize(428);
+  closed.resize(191);
+  closed.resize(428);
+  closed.layout.setPanelHidden(false);
+  assert.equal(closed.grid.height, 176, 'a second short window replaced the remembered height of a closed panel with its squeezed size');
 }
 
-const sections = { activity, 'activity-lifecycle': activityLifecycle, 'activity-overflow': activityOverflow, modal, bars, panel, sash, 'status-toggle': statusToggle, 'panel-save': panelSave, 'panel-round-trip': panelRoundTrip };
+function panelMinimumWidth() {
+  const text = source('0041');
+  for (const android of [false, true]) {
+    const minimum = vm.runInNewContext(`(function() ${body(text, 'get minimumWidth()')})`, {
+      isAndroid: android, isHorizontal: position => position === 'top' || position === 'bottom',
+    });
+    for (const position of ['top', 'bottom', 'left', 'right']) {
+      for (const [available, expected] of [[800, 300], [300, 300], [299, 149.5], [261, 130.5], [91, 45.5], [0, 0], [-79, 0]]) {
+        const adaptive = android && (position === 'top' || position === 'bottom');
+        const mainContainer = {};
+        const panel = { layoutService: {
+          mainContainer, getPanelPosition: () => position,
+          getMaximumEditorDimensions(container) {
+            assert.ok(adaptive, 'vertical panels must not recurse through their own minimum');
+            assert.equal(container, mainContainer);
+            return { width: available };
+          },
+        } };
+        assert.equal(minimum.call(panel), adaptive ? expected : 300, `${android}/${position}/${available}`);
+      }
+    }
+  }
+}
+
+function terminalRanges() {
+  const text = source('0040');
+  const highlight = vm.runInNewContext(`(function(range) ${body(text, 'private _highlightBufferRange(')
+    .replace('let renderedElement: HTMLElement | undefined;', 'let renderedElement;')})`);
+  const cases = [
+    ['single line', [4, 2, 12, 2], [[1, 3, 9]]],
+    ['single cell', [40, 2, 40, 2], [[1, 39, 1]]],
+    ['wrapped link', [36, 2, 17, 3], [[1, 35, 5], [2, 0, 17]]],
+    ['wrapped increasing columns', [4, 2, 12, 3], [[1, 3, 37], [2, 0, 12]]],
+    ['three rows', [36, 2, 17, 4], [[1, 35, 5], [2, 0, 40], [3, 0, 17]]],
+    ['history rows', [1, 2, 40, 4], [[1, 0, 40], [2, 0, 40], [3, 0, 40]]],
+    ['trimmed final colon', [36, 2, 0, 3], [[1, 35, 5]]],
+  ];
+  for (const [name, [startX, startY, endX, endY], expected] of cases) {
+    const decorations = [], actual = [];
+    let reset = 0;
+    const addon = {
+      _navigationDecorations: [],
+      _resetNavigationDecorations() { reset++; },
+      _createMarkerForOffset(line, offset) { return { line: line + offset }; },
+      _terminal: { cols: 40, registerDecoration({ marker, x, width }) {
+        assert.ok(Number.isInteger(x) && x >= 0, `${name}: invalid start column`);
+        assert.ok(Number.isInteger(width) && width > 0 && x + width <= 40, `${name}: invalid width ${width}`);
+        actual.push([marker.line, x, width]);
+        let dispose;
+        const decoration = { onRender() {}, onDispose(callback) { dispose = callback; }, dispose() { dispose(); } };
+        decorations.push(decoration);
+        return decoration;
+      } },
+    };
+    highlight.call(addon, { start: { x: startX, y: startY }, end: { x: endX, y: endY } });
+    assert.deepEqual(actual, expected, name);
+    assert.equal(reset, 1, `${name}: clear the previous preview`);
+    assert.equal(addon._navigationDecorations.length, expected.length, name);
+    for (const decoration of decorations) decoration.dispose();
+    assert.equal(addon._navigationDecorations.length, 0, `${name}: forget disposed highlights`);
+  }
+  highlight.call({ _terminal: undefined, _resetNavigationDecorations() { assert.fail('missing terminal must be a no-op'); } }, {});
+}
+
+const sections = { activity, 'activity-lifecycle': activityLifecycle, 'activity-overflow': activityOverflow, modal, bars, panel, sash, 'status-toggle': statusToggle, 'panel-save': panelSave, 'panel-round-trip': panelRoundTrip, 'panel-minimum-width': panelMinimumWidth, 'terminal-ranges': terminalRanges };
 for (const name of process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(sections)) {
   assert.ok(sections[name], `Unknown section ${name}`);
   sections[name]();
